@@ -2,13 +2,14 @@ use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use cursive::traits::Nameable;
 use cursive::{Cursive, CursiveRunner};
 use log::{error, info, trace};
 
 #[cfg(unix)]
-use signal_hook::{consts::SIGHUP, consts::SIGTERM, iterator::Signals};
+use signal_hook::{consts::SIGHUP, consts::SIGINT, consts::SIGTERM, iterator::Signals};
 
 use crate::command::Command;
 use crate::commands::CommandManager;
@@ -81,6 +82,7 @@ impl Application {
     ///
     /// * `configuration_file_path` - Relative path to the configuration file inside the base path
     pub fn new(configuration_file_path: Option<String>) -> Result<Self, Box<dyn Error>> {
+        let startup_started = Instant::now();
         // Things here may cause the process to abort; we must do them before creating curses
         // windows otherwise the error message will not be seen by a user
 
@@ -94,12 +96,22 @@ impl Application {
             .unwrap();
 
         let configuration = Arc::new(Config::new(configuration_file_path));
+        info!("Configuration loaded in {:?}", startup_started.elapsed());
+        authentication::client_id(&configuration)?;
+        authentication::spotify_client_id(&configuration)?;
+        let credentials_started = Instant::now();
         let credentials = authentication::get_credentials(&configuration)?;
+        info!(
+            "Spotify credentials ready in {:?}",
+            credentials_started.elapsed()
+        );
         let theme = configuration.build_theme();
 
-        if let Err(e) = authentication::get_rspotify_token() {
+        let token_started = Instant::now();
+        if let Err(e) = authentication::get_rspotify_token(&configuration, true) {
             error!("Failed to get rspotify token: {e}");
         }
+        info!("Web API token ready in {:?}", token_started.elapsed());
 
         println!("Connecting to Spotify..");
 
@@ -115,14 +127,22 @@ impl Application {
 
         let event_manager = EventManager::new(cursive.cb_sink().clone());
 
+        let spotify_started = Instant::now();
         let mut spotify =
             spotify::Spotify::new(event_manager.clone(), credentials, configuration.clone())?;
+        info!("Spotify session ready in {:?}", spotify_started.elapsed());
 
+        let library_started = Instant::now();
         let library = Arc::new(Library::new(
             event_manager.clone(),
             spotify.clone(),
             configuration.clone(),
         ));
+        info!("Library UI ready in {:?}", library_started.elapsed());
+        info!(
+            "Total startup before event loop: {:?}",
+            startup_started.elapsed()
+        );
 
         let queue = Arc::new(queue::Queue::new(
             spotify.clone(),
@@ -250,8 +270,26 @@ impl Application {
     /// Start the application and run the event loop.
     pub fn run(&mut self) -> Result<(), String> {
         #[cfg(unix)]
-        let mut signals =
-            Signals::new([SIGTERM, SIGHUP]).expect("could not register signal handler");
+        {
+            let mut signals =
+                Signals::new([SIGTERM, SIGHUP, SIGINT]).expect("could not register signal handler");
+            let sink = self.cursive.cb_sink().clone();
+            // Handle signals from a separate thread and wake the Cursive event loop through its
+            // callback channel. Waiting for `signals.pending()` in the main loop is not reliable
+            // when the terminal has been closed or the loop is blocked in a backend poll.
+            std::thread::spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    info!("Caught {signal}, cleaning up and closing");
+                    let _ = sink.send(Box::new(|s| {
+                        if let Some(data) = s.user_data::<UserData>().cloned() {
+                            data.cmd.handle(s, Command::Quit);
+                        } else {
+                            s.quit();
+                        }
+                    }));
+                }
+            });
+        }
 
         // cursive event loop
         while self.cursive.is_running() {
@@ -261,15 +299,6 @@ impl Application {
                 .call_on_name("cover", |view: &mut ui::cover::CoverView| {
                     view.render_to_terminal();
                 });
-            #[cfg(unix)]
-            for signal in signals.pending() {
-                if signal == SIGTERM || signal == SIGHUP {
-                    info!("Caught {signal}, cleaning up and closing");
-                    if let Some(data) = self.cursive.user_data::<UserData>().cloned() {
-                        data.cmd.handle(&mut self.cursive, Command::Quit);
-                    }
-                }
-            }
             for event in self.event_manager.msg_iter() {
                 match event {
                     Event::Player(state) => {

@@ -15,6 +15,7 @@ mod authentication;
 mod cli;
 mod command;
 mod commands;
+mod completion;
 mod config;
 mod events;
 mod ext_traits;

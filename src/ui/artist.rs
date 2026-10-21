@@ -97,9 +97,21 @@ impl ArtistView {
     ) -> ListView<Album> {
         if let Some(artist_id) = &artist.id {
             let spotify = queue.get_spotify();
-            let albums_page = spotify.api.artist_albums(artist_id, Some(album_type));
-            let view = ListView::new(albums_page.items.clone(), queue, library);
-            albums_page.apply_pagination(view.get_pagination());
+            let artist_id = artist_id.clone();
+            let items = Arc::new(RwLock::new(Vec::new()));
+            let view = ListView::new(items.clone(), queue.clone(), library.clone());
+            let pagination = view.get_pagination().clone();
+            let library_for_thread = library.clone();
+
+            // Fetch the first page off the UI thread.
+            thread::spawn(move || {
+                let mut albums_page = spotify.api.artist_albums(&artist_id, Some(album_type));
+                let first_page = albums_page.items.read().unwrap().clone();
+                items.write().unwrap().extend(first_page);
+                albums_page.items = items;
+                albums_page.apply_pagination(&pagination);
+                library_for_thread.trigger_redraw();
+            });
 
             view
         } else {

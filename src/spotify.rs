@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use crate::application::ASYNC_RUNTIME;
-use crate::authentication::SPOTIFY_CLIENT_ID;
+use crate::authentication::spotify_client_id;
 use crate::config;
 use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
@@ -77,7 +77,7 @@ impl Spotify {
             credentials,
             cfg: cfg.clone(),
             status: Arc::new(RwLock::new(PlayerEvent::Stopped)),
-            api: WebApi::new(),
+            api: WebApi::new(cfg.clone()),
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
@@ -86,6 +86,14 @@ impl Spotify {
         let (user_tx, user_rx) = oneshot::channel();
         spotify.start_worker(Some(user_tx))?;
         let user = ASYNC_RUNTIME.get().unwrap().block_on(user_rx).ok();
+        // a login's access token expires, the stored credentials don't
+        if let Some(saved) = Cache::new(Some(config::cache_path("librespot")), None, None, None)
+            .ok()
+            .and_then(|cache| cache.credentials())
+            .filter(|saved| saved.username == user)
+        {
+            spotify.credentials = saved;
+        }
         let volume = cfg.state().volume;
         spotify.set_volume(volume, false);
 
@@ -109,9 +117,9 @@ impl Spotify {
             #[cfg(feature = "mpris")]
             mpris: Default::default(),
             credentials: Credentials::with_password("test_user", "test_pass"),
-            cfg,
+            cfg: cfg.clone(),
             status: Arc::new(RwLock::new(PlayerEvent::Stopped)),
-            api: WebApi::new(),
+            api: WebApi::new(cfg),
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
@@ -149,7 +157,7 @@ impl Spotify {
     /// Generate the librespot [SessionConfig] used when creating a [Session].
     pub fn session_config(cfg: &config::Config) -> SessionConfig {
         let mut session_config = librespot_core::SessionConfig {
-            client_id: SPOTIFY_CLIENT_ID.to_string(),
+            client_id: spotify_client_id(cfg).unwrap_or_default(),
             ..Default::default()
         };
         match cfg
@@ -160,7 +168,7 @@ impl Spotify {
             .or_else(|| env::var("http_proxy").ok())
         {
             Some(proxy) if !proxy.is_empty() => {
-                info!("Setting proxy {proxy}");
+                info!("Setting the configured proxy");
                 session_config.proxy = Url::parse(&proxy).ok();
             }
             _ => debug!("No proxy set"),
@@ -267,7 +275,7 @@ impl Spotify {
             ..Default::default()
         };
 
-        let session = Self::create_session(&cfg, credentials)
+        let session = Self::create_session(&cfg, credentials.clone())
             .await
             .expect("Could not create session");
         user_tx.map(|tx| tx.send(session.username()));
@@ -279,11 +287,12 @@ impl Spotify {
         mixer.set_volume(volume);
 
         let audio_format: librespot_playback::config::AudioFormat = Default::default();
+        let backend_cfg = cfg.clone();
         let player = Player::new(
             player_config,
             session.clone(),
             mixer.get_soft_volume(),
-            move || (backend)(cfg.values().backend_device.clone(), audio_format),
+            move || (backend)(backend_cfg.values().backend_device.clone(), audio_format),
         );
         let player_events = player.get_player_event_channel();
 
@@ -294,6 +303,8 @@ impl Spotify {
             session,
             player,
             mixer,
+            cfg,
+            credentials,
         );
         debug!("worker thread ready.");
         worker.run_loop().await;

@@ -59,10 +59,10 @@ impl ContextMenu {
         track: Track,
     ) -> NamedView<AddToPlaylistMenu> {
         let mut list_select: SelectView<Playlist> = SelectView::new();
-        let current_user_id = library.user_id.as_ref().unwrap();
+        let current_user_id = library.user_id.as_ref();
 
         for list in library.playlists.read().unwrap().iter() {
-            if current_user_id == &list.owner_id || list.collaborative {
+            if current_user_id == Some(&list.owner_id) || list.collaborative {
                 list_select.add_item(list.name.clone(), list.clone());
             }
         }
@@ -73,6 +73,7 @@ impl ContextMenu {
             let spotify = spotify.clone();
             let library = library.clone();
 
+            playlist.load_tracks(&spotify);
             if playlist.has_track(track.id.as_ref().unwrap_or(&String::new())) {
                 let mut already_added_dialog = Self::track_already_added();
 

@@ -1,6 +1,6 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -12,10 +12,11 @@ use rspotify::model::{
     PlaylistId, PlaylistResult, PrivateUser, Recommendations, SavedAlbum, SavedTrack, SearchResult,
     SearchType, Show, ShowId, SimplifiedTrack, TrackId, UserId,
 };
-use rspotify::{AuthCodeSpotify, ClientError, ClientResult, Config, prelude::*};
+use rspotify::{AuthCodeSpotify, ClientError, ClientResult, prelude::*};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::config::Config as AppConfig;
 use crate::model::album::Album;
 use crate::model::artist::Artist;
 use crate::model::category::Category;
@@ -26,7 +27,29 @@ use crate::model::track::Track;
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
 
-/// Convenient wrapper around the rspotify web API functionality.
+/// Maximum number of times an API call is retried after being rate limited.
+const MAX_RATE_LIMIT_RETRIES: u32 = 5;
+/// Waiting time before the first retry when the API doesn't say how long to wait.
+const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(1);
+/// Upper bound for a single wait, so a huge `Retry-After` can't freeze the caller for hours.
+const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Spotify development-mode apps reject search page sizes above 10.
+const SEARCH_PAGE_LIMIT: u32 = 10;
+/// Minimum time between failed token refreshes.
+const TOKEN_REFRESH_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Time to wait before retrying a rate limited call.
+///
+/// Uses the `Retry-After` value (in seconds) when present, otherwise an exponential backoff based
+/// on the number of `retries` already made. The result never exceeds [`RATE_LIMIT_MAX_DELAY`].
+fn rate_limit_delay(retry_after: Option<u64>, retries: u32) -> Duration {
+    let delay = match retry_after {
+        Some(seconds) => Duration::from_secs(seconds),
+        None => RATE_LIMIT_BASE_DELAY.saturating_mul(2u32.saturating_pow(retries)),
+    };
+    delay.min(RATE_LIMIT_MAX_DELAY)
+}
+
 #[derive(Clone)]
 pub struct WebApi {
     /// Rspotify web API.
@@ -37,31 +60,54 @@ pub struct WebApi {
     worker_channel: Arc<RwLock<Option<mpsc::UnboundedSender<WorkerCommand>>>>,
     /// Time at which the token expires.
     token_expiration: Arc<RwLock<DateTime<Utc>>>,
+    /// Instant before which no request should be sent, because the API rate limited us. Shared
+    /// by all clones so concurrent calls don't keep hitting the limit while it is in effect.
+    rate_limited_until: Arc<Mutex<Option<Instant>>>,
+    /// The local configuration, needed to refresh the Web API token.
+    cfg: Arc<AppConfig>,
+    /// Held while refreshing, so refreshes don't overlap.
+    refresh_lock: Arc<Mutex<()>>,
+    /// Don't retry a failed token refresh before this instant.
+    refresh_failed_until: Arc<Mutex<Option<Instant>>>,
 }
 
-impl Default for WebApi {
-    fn default() -> Self {
-        let config = Config {
+impl WebApi {
+    pub fn new(cfg: Arc<AppConfig>) -> Self {
+        let client_id = crate::authentication::client_id(&cfg).unwrap_or_default();
+        let config = rspotify::Config {
             token_refreshing: false,
             ..Default::default()
         };
         let api = AuthCodeSpotify::with_config(
-            rspotify::Credentials::new(crate::authentication::NCSPOT_CLIENT_ID, ""),
+            rspotify::Credentials::new(&client_id, ""),
             rspotify::OAuth::default(),
             config,
         );
+        let token_expiration = Arc::new(RwLock::new(Utc::now()));
+        // Application::new has already ensured that a token exists. Load it here so that
+        // Spotify::new does not have to refresh a still-valid token during startup.
+        if let Ok(token) = crate::authentication::get_rspotify_token(&cfg, false) {
+            let expires_at = token
+                .expires_at
+                .unwrap_or_else(|| Utc::now() + ChronoDuration::hours(1));
+            *api.token.lock().unwrap() = Some(token);
+            *token_expiration.write().unwrap() = expires_at;
+        }
         Self {
             api,
             user: None,
             worker_channel: Arc::new(RwLock::new(None)),
-            token_expiration: Arc::new(RwLock::new(Utc::now())),
+            token_expiration,
+            rate_limited_until: Arc::new(Mutex::new(None)),
+            cfg,
+            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_failed_until: Arc::new(Mutex::new(None)),
         }
     }
-}
 
-impl WebApi {
-    pub fn new() -> Self {
-        Self::default()
+    /// The username of the logged in user.
+    pub fn user(&self) -> Option<String> {
+        self.user.clone()
     }
 
     /// Set the username for use with the API.
@@ -78,75 +124,162 @@ impl WebApi {
         self.worker_channel = channel;
     }
 
-    /// Update the authentication token when it expires.
-    pub fn update_token(&self) -> Option<JoinHandle<()>> {
+    /// Whether the token expires within 5 minutes.
+    fn needs_token_update(&self) -> bool {
+        let delta = *self.token_expiration.read().unwrap() - Utc::now();
+        delta.num_seconds() <= 60 * 5
+    }
+
+    /// Refresh the token without starting an interactive login. Safe to call from API worker
+    /// threads. A failed refresh is not retried for a minute.
+    fn refresh_token_blocking(&self, force: bool) -> bool {
+        let _guard = self.refresh_lock.lock().unwrap();
+        if !force && !self.needs_token_update() {
+            return true;
+        }
+        if let Some(until) = *self.refresh_failed_until.lock().unwrap()
+            && Instant::now() < until
         {
-            let token_expiration = self.token_expiration.read().unwrap();
-            let now = Utc::now();
-            let delta = *token_expiration - now;
-
-            // token is valid for 5 more minutes, renewal is not necessary yet
-            if delta.num_seconds() > 60 * 5 {
-                return None;
-            }
-
-            info!("Token will expire in {delta}, renewing");
+            return false;
         }
 
-        let api_token = self.api.token.clone();
-        let api_token_expiration = self.token_expiration.clone();
-        Some(ASYNC_RUNTIME.get().unwrap().spawn_blocking(move || {
-            match crate::authentication::get_rspotify_token() {
-                Ok(token) => {
-                    let expires_at = token
-                        .expires_at
-                        .unwrap_or_else(|| Utc::now() + ChronoDuration::hours(1));
-                    *api_token.lock().unwrap() = Some(token);
-                    *api_token_expiration.write().unwrap() = expires_at;
-                }
-                Err(e) => {
-                    error!("Failed to update token: {e}");
-                }
+        let result = if force {
+            crate::authentication::refresh_rspotify_token(&self.cfg)
+        } else {
+            crate::authentication::get_rspotify_token(&self.cfg, false)
+        };
+        match result {
+            Ok(token) => {
+                let expires_at = token
+                    .expires_at
+                    .unwrap_or_else(|| Utc::now() + ChronoDuration::hours(1));
+                *self.api.token.lock().unwrap() = Some(token);
+                *self.token_expiration.write().unwrap() = expires_at;
+                *self.refresh_failed_until.lock().unwrap() = None;
+                true
             }
+            Err(e) => {
+                error!("Failed to update Web API token for client ID: {e}");
+                *self.refresh_failed_until.lock().unwrap() =
+                    Some(Instant::now() + TOKEN_REFRESH_BACKOFF);
+                false
+            }
+        }
+    }
+
+    /// Update the authentication token when it expires.
+    pub fn update_token(&self) -> Option<JoinHandle<()>> {
+        if !self.needs_token_update() {
+            return None;
+        }
+        let delta = *self.token_expiration.read().unwrap() - Utc::now();
+        info!("Token will expire in {delta}, renewing");
+        let client = self.clone();
+        Some(ASYNC_RUNTIME.get().unwrap().spawn_blocking(move || {
+            client.refresh_token_blocking(false);
         }))
     }
 
-    /// Execute `api_call` and retry once if a rate limit occurs.
+    /// Block until any rate limit cooldown shared between all API calls has elapsed.
+    fn wait_for_rate_limit(&self) {
+        loop {
+            let deadline = *self.rate_limited_until.lock().unwrap();
+            match deadline.and_then(|d| d.checked_duration_since(Instant::now())) {
+                Some(remaining) if !remaining.is_zero() => thread::sleep(remaining),
+                _ => return,
+            }
+        }
+    }
+
+    /// Make every API call wait at least `delay` before being sent.
+    fn start_rate_limit_cooldown(&self, delay: Duration) {
+        let mut until = self.rate_limited_until.lock().unwrap();
+        let deadline = Instant::now() + delay;
+        if until.is_none_or(|current| deadline > current) {
+            *until = Some(deadline);
+        }
+    }
+
+    /// Execute `api_call`, retrying when a rate limit is hit or the token has expired.
+    ///
+    /// Rate limited calls (HTTP 429) are retried up to [`MAX_RATE_LIMIT_RETRIES`] times, waiting
+    /// for the duration requested by the `Retry-After` header, or with an exponential backoff if
+    /// the header is missing. The wait applies to all concurrent API calls, not only the one that
+    /// was rate limited. A call that hits an expired token (HTTP 401) is retried once after
+    /// refreshing the token.
     fn api_with_retry<F, R>(&self, api_call: F) -> Option<R>
     where
         F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
     {
-        let result = { api_call(&self.api) };
-        match result {
-            Ok(v) => Some(v),
-            Err(ClientError::Http(error)) => {
-                debug!("http error: {error:?}");
-                match error.as_ref() {
-                    HttpError::StatusCode(response) => match response.status() {
-                        429 => {
-                            let waiting_duration = response
+        self.api_with_retry_inner(api_call, false)
+    }
+
+    /// Like [`Self::api_with_retry`], but an endpoint that is unavailable to this app (for
+    /// example because it was removed in Spotify development mode) returns `None` quietly.
+    fn api_with_retry_optional<F, R>(&self, api_call: F) -> Option<R>
+    where
+        F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
+    {
+        self.api_with_retry_inner(api_call, true)
+    }
+
+    fn api_with_retry_inner<F, R>(&self, api_call: F, allow_forbidden: bool) -> Option<R>
+    where
+        F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
+    {
+        let mut rate_limit_retries = 0;
+        let mut token_refreshed = false;
+        loop {
+            self.wait_for_rate_limit();
+            match api_call(&self.api) {
+                Ok(v) => return Some(v),
+                Err(ClientError::Http(error)) => {
+                    debug!("http error: {error:?}");
+                    let HttpError::StatusCode(response) = error.as_ref() else {
+                        return None;
+                    };
+                    let status = response.status();
+                    match status {
+                        429 if rate_limit_retries < MAX_RATE_LIMIT_RETRIES => {
+                            let retry_after = response
                                 .header("Retry-After")
                                 .and_then(|v| v.parse::<u64>().ok());
-                            debug!("rate limit hit. waiting {waiting_duration:?} seconds");
-                            thread::sleep(Duration::from_secs(waiting_duration.unwrap_or(0)));
-                            api_call(&self.api).ok()
+                            let waiting_duration =
+                                rate_limit_delay(retry_after, rate_limit_retries);
+                            debug!(
+                                "rate limit hit. waiting {waiting_duration:?} (retry {}/{MAX_RATE_LIMIT_RETRIES})",
+                                rate_limit_retries + 1
+                            );
+                            self.start_rate_limit_cooldown(waiting_duration);
+                            rate_limit_retries += 1;
                         }
-                        401 => {
+                        429 => {
+                            error!(
+                                "giving up after {MAX_RATE_LIMIT_RETRIES} retries: Spotify API rate limit exceeded"
+                            );
+                            return None;
+                        }
+                        401 if !token_refreshed => {
                             debug!("token unauthorized. trying refresh..");
-                            self.update_token()
-                                .and_then(move |_| api_call(&self.api).ok())
+                            if !self.refresh_token_blocking(true) {
+                                return None;
+                            }
+                            token_refreshed = true;
+                        }
+                        403 | 404 if allow_forbidden => {
+                            debug!("optional Spotify endpoint is unavailable: {response:?}");
+                            return None;
                         }
                         _ => {
                             error!("unhandled api error: {response:?}");
-                            None
+                            return None;
                         }
-                    },
-                    _ => None,
+                    }
                 }
-            }
-            Err(e) => {
-                error!("unhandled api error: {e}");
-                None
+                Err(e) => {
+                    error!("unhandled api error: {e}");
+                    return None;
+                }
             }
         }
     }
@@ -329,7 +462,7 @@ impl WebApi {
         seed_genres: Option<Vec<&str>>,
         seed_tracks: Option<Vec<&str>>,
     ) -> Result<Recommendations, ()> {
-        self.api_with_retry(|api| {
+        self.api_with_retry_optional(|api| {
             let seed_artistids = seed_artists.as_ref().map(|artistids| {
                 artistids
                     .iter()
@@ -363,6 +496,8 @@ impl WebApi {
         limit: u32,
         offset: u32,
     ) -> Result<SearchResult, ()> {
+        // Spotify development-mode apps reject larger pages.
+        let limit = limit.min(SEARCH_PAGE_LIMIT);
         self.api_with_retry(|api| {
             api.search(
                 query,
@@ -670,7 +805,7 @@ impl WebApi {
     /// Get the top tracks of the artist with the given `id`.
     pub fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ()> {
         #[allow(deprecated)]
-        self.api_with_retry(|api| {
+        self.api_with_retry_optional(|api| {
             api.artist_top_tracks(ArtistId::from_id(id).unwrap(), Some(Market::FromToken))
         })
         .map(|ft| ft.iter().map(|t| t.into()).collect())
@@ -680,9 +815,11 @@ impl WebApi {
     /// Get artists related to the artist with the given `id`.
     pub fn artist_related_artists(&self, id: &str) -> Result<Vec<Artist>, ()> {
         #[allow(deprecated)]
-        self.api_with_retry(|api| api.artist_related_artists(ArtistId::from_id(id).unwrap()))
-            .map(|fa| fa.iter().map(|a| a.into()).collect())
-            .ok_or(())
+        self.api_with_retry_optional(|api| {
+            api.artist_related_artists(ArtistId::from_id(id).unwrap())
+        })
+        .map(|fa| fa.iter().map(|a| a.into()).collect())
+        .ok_or(())
     }
 
     /// Get the available categories.
@@ -691,7 +828,7 @@ impl WebApi {
         let spotify = self.clone();
         let fetch_page = move |offset: u32| {
             debug!("fetching categories, offset: {offset}");
-            spotify.api_with_retry(|api| {
+            spotify.api_with_retry_optional(|api| {
                 #[allow(deprecated)]
                 match api.categories_manual(
                     None,
@@ -718,7 +855,7 @@ impl WebApi {
         let category_id = category_id.to_string();
         let fetch_page = move |offset: u32| {
             debug!("fetching category playlists, offset: {offset}");
-            spotify.api_with_retry(|api| {
+            spotify.api_with_retry_optional(|api| {
                 #[allow(deprecated)]
                 match api.category_playlists_manual(
                     &category_id,
@@ -741,5 +878,30 @@ impl WebApi {
     /// Get details about the logged in user.
     pub fn current_user(&self) -> Result<PrivateUser, ()> {
         self.api_with_retry(|api| api.current_user()).ok_or(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_delay_honours_retry_after() {
+        assert_eq!(rate_limit_delay(Some(6), 0), Duration::from_secs(6));
+        assert_eq!(rate_limit_delay(Some(6), 4), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn rate_limit_delay_backs_off_exponentially_without_retry_after() {
+        let delays: Vec<_> = (0..5)
+            .map(|n| rate_limit_delay(None, n).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16]);
+    }
+
+    #[test]
+    fn rate_limit_delay_is_capped() {
+        assert_eq!(rate_limit_delay(Some(86_400), 0), RATE_LIMIT_MAX_DELAY);
+        assert_eq!(rate_limit_delay(None, 100), RATE_LIMIT_MAX_DELAY);
     }
 }

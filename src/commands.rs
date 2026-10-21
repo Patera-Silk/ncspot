@@ -201,7 +201,7 @@ impl CommandManager {
                 Ok(None)
             }
             Command::UpdateLibrary => {
-                self.library.update_library();
+                self.library.update_library(true);
                 Ok(None)
             }
             Command::TogglePlay => {
@@ -277,7 +277,7 @@ impl CommandManager {
             }
             Command::NewPlaylist(name) => {
                 match self.spotify.api.create_playlist(name, None, None) {
-                    Ok(_) => self.library.update_library(),
+                    Ok(_) => self.library.update_library(false),
                     Err(_) => error!("could not create playlist {name}"),
                 }
                 Ok(None)
@@ -306,7 +306,10 @@ impl CommandManager {
 
                 let mut credentials_path = crate::config::cache_path("librespot");
                 credentials_path.push("credentials.json");
-                std::fs::remove_file(credentials_path).unwrap();
+                if let Err(e) = std::fs::remove_file(&credentials_path) {
+                    log::warn!("Failed to remove cached Spotify credentials: {e}");
+                }
+                crate::authentication::remove_rspotify_tokens();
 
                 s.quit();
                 Ok(None)

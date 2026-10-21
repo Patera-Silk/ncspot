@@ -1,6 +1,6 @@
 use std::fs;
-use std::net::TcpListener;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use librespot_core::authentication::Credentials as RespotCredentials;
 use librespot_core::cache::Cache;
@@ -10,17 +10,17 @@ use log::{error, info, warn};
 use crate::config::{self, Config};
 use crate::spotify::Spotify;
 
-pub const SPOTIFY_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+const CLIENT_ID_ENV: &str = "NCSPOT_CLIENT_ID";
+const SPOTIFY_CLIENT_ID_ENV: &str = "NCSPOT_SPOTIFY_CLIENT_ID";
+const REDIRECT_PORT_ENV: &str = "NCSPOT_OAUTH_REDIRECT_PORT";
 
-// This is a client ID issued specifically for ncspot tied to my personal Spotify account.
-// Please do not use it without my permission.
-pub const NCSPOT_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
+/// Port used by the local OAuth redirect. Spotify requires registered redirect URIs, so this
+/// can't use a random free port.
+pub const DEFAULT_REDIRECT_PORT: u16 = 8989;
 
 static OAUTH_SCOPES: &[&str] = &[
-    "playlist-modify",
     "playlist-modify-private",
     "playlist-modify-public",
-    "playlist-read",
     "playlist-read-collaborative",
     "playlist-read-private",
     "streaming",
@@ -28,13 +28,9 @@ static OAUTH_SCOPES: &[&str] = &[
     "user-follow-read",
     "user-library-modify",
     "user-library-read",
-    "user-modify",
     "user-modify-playback-state",
-    "user-modify-private",
-    "user-personalized",
     "user-read-currently-playing",
     "user-read-email",
-    "user-read-play-history",
     "user-read-playback-position",
     "user-read-playback-state",
     "user-read-private",
@@ -42,42 +38,65 @@ static OAUTH_SCOPES: &[&str] = &[
     "user-top-read",
 ];
 
-static NCSPOT_OAUTH_SCOPES: &[&str] = &[
-    "streaming",
-    "user-read-email",
-    "user-read-private",
-    "user-library-read",
-    "user-library-modify",
-    "user-read-playback-state",
-    "user-modify-playback-state",
-    "playlist-read-private",
-    "playlist-modify-public",
-    "playlist-modify-private",
-    "user-follow-read",
-    "user-follow-modify",
-    "user-top-read",
-    "user-read-currently-playing",
-    "user-read-recently-played",
-];
-
-pub fn find_free_port() -> Result<u16, String> {
-    let socket = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    socket
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|e| e.to_string())
-}
-
 enum ClientUriSuffix {
     Ncspot,
     Spotify,
 }
 
-fn get_client_redirect_uri(suffix: ClientUriSuffix) -> String {
-    let auth_port = find_free_port().expect("Could not find free port");
+/// The client ID for Web API calls. It can be set in the environment or in the local config.
+pub fn client_id(configuration: &Config) -> Result<String, String> {
+    client_id_from_env(CLIENT_ID_ENV)
+        .or_else(|| configuration.values().client_id.clone())
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| missing_client_id_message(configuration, CLIENT_ID_ENV, "client_id"))
+}
+
+/// The client ID for the Spotify session. Defaults to the Web API client ID, so a single Spotify
+/// app can be used for both logins.
+pub fn spotify_client_id(configuration: &Config) -> Result<String, String> {
+    client_id_from_env(SPOTIFY_CLIENT_ID_ENV)
+        .or_else(|| configuration.values().spotify_client_id.clone())
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .or_else(|| client_id(configuration).ok())
+        .ok_or_else(|| {
+            missing_client_id_message(configuration, SPOTIFY_CLIENT_ID_ENV, "spotify_client_id")
+        })
+}
+
+fn client_id_from_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn missing_client_id_message(configuration: &Config, env_name: &str, config_name: &str) -> String {
+    let port = redirect_port(configuration);
+    format!(
+        "No Spotify client ID configured.\n\
+         Set {env_name} or `{config_name}` in config.toml to the client ID of your own Spotify app.\n\
+         Add these redirect URIs to the app:\n\
+         http://127.0.0.1:{port}/login\n\
+         http://127.0.0.1:{port}/ncspot_login\n\
+         The client ID is a public OAuth identifier, not a client secret."
+    )
+}
+
+/// The local port used for OAuth redirects.
+pub fn redirect_port(configuration: &Config) -> u16 {
+    client_id_from_env(REDIRECT_PORT_ENV)
+        .and_then(|value| value.parse::<u16>().ok())
+        .or(configuration.values().oauth_redirect_port)
+        .unwrap_or(DEFAULT_REDIRECT_PORT)
+}
+
+fn get_client_redirect_uri(configuration: &Config, suffix: ClientUriSuffix) -> String {
+    let port = redirect_port(configuration);
     match suffix {
-        ClientUriSuffix::Ncspot => format!("http://127.0.0.1:{auth_port}/ncspot_login"),
-        ClientUriSuffix::Spotify => format!("http://127.0.0.1:{auth_port}/login"),
+        ClientUriSuffix::Ncspot => format!("http://127.0.0.1:{port}/ncspot_login"),
+        ClientUriSuffix::Spotify => format!("http://127.0.0.1:{port}/login"),
     }
 }
 
@@ -95,32 +114,35 @@ pub fn get_credentials(configuration: &Config) -> Result<RespotCredentials, Stri
             }
             None => {
                 info!("Attempting to login via OAuth2");
-                credentials_prompt(None)?
+                credentials_prompt(configuration, None)?
             }
         }
     };
 
     while let Err(error) = Spotify::test_credentials(configuration, credentials.clone()) {
         let error_msg = format!("{error}");
-        credentials = credentials_prompt(Some(error_msg))?;
+        credentials = credentials_prompt(configuration, Some(error_msg))?;
     }
     Ok(credentials)
 }
 
-fn credentials_prompt(error_message: Option<String>) -> Result<RespotCredentials, String> {
+fn credentials_prompt(
+    configuration: &Config,
+    error_message: Option<String>,
+) -> Result<RespotCredentials, String> {
     if let Some(message) = error_message {
         eprintln!("Connection error: {message}");
     }
 
-    create_credentials()
+    create_credentials(configuration)
 }
 
-pub fn create_credentials() -> Result<RespotCredentials, String> {
+pub fn create_credentials(configuration: &Config) -> Result<RespotCredentials, String> {
+    let client_id = spotify_client_id(configuration)?;
     println!("To login you need to perform OAuth2 authorization using your web browser\n");
-
     let client_builder = OAuthClientBuilder::new(
-        SPOTIFY_CLIENT_ID,
-        &get_client_redirect_uri(ClientUriSuffix::Spotify),
+        &client_id,
+        &get_client_redirect_uri(configuration, ClientUriSuffix::Spotify),
         OAUTH_SCOPES.to_vec(),
     );
     let oauth_client = client_builder.build().map_err(|e| e.to_string())?;
@@ -131,8 +153,14 @@ pub fn create_credentials() -> Result<RespotCredentials, String> {
         .map_err(|e| e.to_string())
 }
 
-pub fn get_rspotify_token() -> Result<rspotify::Token, String> {
-    let path = config::cache_path("rspotify_token.json");
+/// Cached or refreshed Web API token. If `allow_login` is false, an expired token without a
+/// usable refresh token returns an error instead of starting an interactive login.
+pub fn get_rspotify_token(
+    configuration: &Config,
+    allow_login: bool,
+) -> Result<rspotify::Token, String> {
+    let client_id = client_id(configuration)?;
+    let path = token_path(&client_id);
     let token = if let Ok(token_json) = fs::read_to_string(&path) {
         serde_json::from_str::<rspotify::Token>(&token_json).ok()
     } else {
@@ -143,47 +171,62 @@ pub fn get_rspotify_token() -> Result<rspotify::Token, String> {
         if !t.is_expired() {
             return Ok(t);
         }
-
-        // Token is expired, try to refresh if we have a refresh token. Spotify's refresh
-        // responses may omit the refresh token, in which case it must be reused, so an
-        // empty/missing value here means we don't actually have a usable refresh token.
-        let refresh_token = t.refresh_token.as_deref().filter(|s| !s.is_empty());
-        if let Some(refresh_token) = refresh_token {
-            info!("Access token expired, attempting to refresh..");
-            let client_builder = OAuthClientBuilder::new(
-                NCSPOT_CLIENT_ID,
-                &get_client_redirect_uri(ClientUriSuffix::Ncspot),
-                NCSPOT_OAUTH_SCOPES.to_vec(),
-            );
-            if let Ok(oauth_client) = client_builder.build() {
-                match oauth_client.refresh_token(refresh_token) {
-                    Ok(new_token) => {
-                        let mapped = map_token(new_token, Some(refresh_token));
-                        write_token(&path, &mapped);
-                        return Ok(mapped);
-                    }
-                    Err(e) => {
-                        error!("Failed to refresh token: {e}");
-                    }
-                }
-            }
+        if let Ok(token) = refresh_rspotify_token(configuration) {
+            return Ok(token);
         }
     }
 
-    let t = create_rspotify_token()?;
+    if !allow_login {
+        return Err(format!(
+            "No valid Web API token for this client ID. Restart ncspot to log in again ({}).",
+            path.display()
+        ));
+    }
+
+    let t = create_rspotify_token(configuration)?;
     write_token(&path, &t);
     Ok(t)
 }
 
-pub fn create_rspotify_token() -> Result<rspotify::Token, String> {
+/// Refresh the cached Web API token using its refresh token, even if the token has not expired
+/// yet. This is used after the API answers 401.
+pub fn refresh_rspotify_token(configuration: &Config) -> Result<rspotify::Token, String> {
+    let client_id = client_id(configuration)?;
+    let path = token_path(&client_id);
+    let token_json = fs::read_to_string(&path)
+        .map_err(|e| format!("No cached Web API token for this client ID: {e}"))?;
+    let token: rspotify::Token = serde_json::from_str(&token_json)
+        .map_err(|e| format!("Could not parse the cached Web API token: {e}"))?;
+    let refresh_token = token
+        .refresh_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "The cached Web API token has no refresh token".to_string())?;
+
+    info!("Attempting to refresh the Web API token");
+    let client_builder = OAuthClientBuilder::new(
+        &client_id,
+        &get_client_redirect_uri(configuration, ClientUriSuffix::Ncspot),
+        OAUTH_SCOPES.to_vec(),
+    );
+    let oauth_client = client_builder.build().map_err(|e| e.to_string())?;
+    let new_token = oauth_client
+        .refresh_token(refresh_token)
+        .map_err(|e| format!("Failed to refresh token: {e}"))?;
+    let mapped = map_token(new_token, Some(refresh_token));
+    write_token(&path, &mapped);
+    Ok(mapped)
+}
+
+pub fn create_rspotify_token(configuration: &Config) -> Result<rspotify::Token, String> {
+    let client_id = client_id(configuration)?;
     println!(
         "To fully enable Web API features, you need to perform a second OAuth2 authorization\n"
     );
-
     let client_builder = OAuthClientBuilder::new(
-        NCSPOT_CLIENT_ID,
-        &get_client_redirect_uri(ClientUriSuffix::Ncspot),
-        NCSPOT_OAUTH_SCOPES.to_vec(),
+        &client_id,
+        &get_client_redirect_uri(configuration, ClientUriSuffix::Ncspot),
+        OAUTH_SCOPES.to_vec(),
     );
     let oauth_client = client_builder.build().map_err(|e| e.to_string())?;
 
@@ -191,6 +234,50 @@ pub fn create_rspotify_token() -> Result<rspotify::Token, String> {
         .get_access_token()
         .map(|token| map_token(token, None))
         .map_err(|e| e.to_string())
+}
+
+/// Remove cached Web API tokens for all client IDs.
+pub fn remove_rspotify_tokens() {
+    let dir = match config::user_cache_directory() {
+        Some(dir) => dir,
+        None => return,
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            error!("Failed to read the cache directory to remove tokens: {e}");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with("rspotify_token")
+            && file_name.ends_with(".json")
+            && let Err(e) = fs::remove_file(entry.path())
+        {
+            warn!(
+                "Failed to remove token cache {}: {e}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+fn token_path(client_id: &str) -> PathBuf {
+    config::cache_path(&token_file_name(client_id))
+}
+
+fn token_file_name(client_id: &str) -> String {
+    let sanitized: String = client_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if sanitized.is_empty() {
+        "rspotify_token_invalid.json".to_string()
+    } else {
+        format!("rspotify_token_{sanitized}.json")
+    }
 }
 
 /// Write `token` to `path`, logging (rather than silently discarding) any failure, and
@@ -204,7 +291,27 @@ fn write_token(path: &Path, token: &rspotify::Token) {
         }
     };
 
-    if let Err(e) = fs::write(path, json) {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::create(path);
+
+    let mut file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to open rspotify token cache: {e}");
+            return;
+        }
+    };
+    if let Err(e) = file.write_all(json.as_bytes()) {
         error!("Failed to write rspotify token cache: {e}");
         return;
     }
@@ -282,5 +389,14 @@ mod test {
     fn map_token_yields_no_refresh_token_when_omitted_without_fallback() {
         let mapped = map_token(oauth_token(""), None);
         assert_eq!(mapped.refresh_token, None);
+    }
+
+    #[test]
+    fn token_cache_is_per_client_and_cannot_escape_the_cache_directory() {
+        assert_eq!(
+            token_file_name("../my-client-id"),
+            "rspotify_token_myclientid.json"
+        );
+        assert_ne!(token_file_name("client-one"), token_file_name("client-two"));
     }
 }

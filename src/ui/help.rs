@@ -9,6 +9,7 @@ use ncspot::CONFIGURATION_FILE_NAME;
 
 use crate::command::{Command, MoveAmount, MoveMode};
 use crate::commands::CommandResult;
+use crate::completion;
 use crate::config::config_path;
 use crate::traits::ViewExt;
 use cursive::view::scroll::Scroller;
@@ -44,6 +45,18 @@ impl HelpView {
                     .join("; ")
             );
             text.append(binding);
+        }
+
+        text.append(StyledString::styled("\n\nCommands\n\n", Effect::Bold));
+        text.append(
+            "Type : to open the command line. Tab completes, repeated Tab cycles matches, \
+             Shift+Tab goes back, and Up/Down browse command history.\n\n",
+        );
+        for spec in completion::specs() {
+            text.append(format!("{:<34} {}\n", spec.usage, spec.description));
+            if !spec.aliases.is_empty() {
+                text.append(format!("{:<34} aliases: {}\n", "", spec.aliases.join(", ")));
+            }
         }
 
         Self {

@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Context-aware Tab completion for commands, aliases, and arguments, with
+  cycling through multiple matches, Shift+Tab for the previous match, inline
+  usage hints, typo suggestions, and in-session command history
+- Command help in the Help view
+- Documentation for the existing shell-completion generator and for using an
+  own Spotify app
+
+### Changed
+
+- Spotify client IDs are no longer hardcoded. ncspot now requires a local
+  `client_id` (or `NCSPOT_CLIENT_ID`) from your own Spotify app, so every
+  installation has its own rate limit.
+- Web API tokens are cached per client ID with restrictive permissions.
+- Playlist tracks load lazily when needed instead of during every startup;
+  albums and podcasts are cached after loading.
+- Album, playlist, podcast, and artist album views load their first page in
+  the background so opening a view does not block the TUI on the API.
+
+### Fixed
+
+- Retry rate-limited Web API calls with a shared backoff, and wait for token
+  refreshes before retrying an unauthorized request
+- A rate limit no longer delays startup, as the current user and the Browse
+  categories load in the background, and the display name is cached
+- Unchanged liked songs and saved albums are no longer downloaded again on
+  every start
+- Failed or partial playlist/shows pages are no longer cached as empty, do not
+  trigger infinite retries, and no longer remove valid cached data
+- Spotify endpoints that are unavailable to development-mode apps now fail
+  quietly instead of logging errors
+- Playing an empty playlist, album, or podcast no longer starts an unrelated
+  track
+- `logout` now removes all cached Web API tokens and no longer panics when the
+  credentials file is already missing
+- Cache files are marked valid as soon as a library sync completes, so an
+  unclean exit no longer makes the next launch ignore them and refetch the
+  whole library
+- SIGTERM, SIGHUP, and SIGINT are handled by a separate thread that wakes the
+  TUI, so ncspot can shut down cleanly even when its terminal has been closed
+- Opening an album or playlist with the mouse no longer deadlocks the UI
+- Command completion and hints follow a custom `command_key`
+- Lazy-loaded playlists are refreshed after adding tracks, and duplicate-track
+  warnings work again
+- Cancelling the command line clears completion and history navigation state
+- Playback keeps the current track playing when Spotify closes the connection,
+  retries failed loads after reconnecting, and resumes preloading
+- `:reconnect` now uses the saved Spotify credentials instead of an expired
+  OAuth access token
+
 ## [1.5.0]
 
 ### Added
@@ -314,6 +367,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Albums with more than 50 songs not showing all the songs when viewed in the library
 - Bug that could cause items to not load until the screen is filled on bigger screens
 
+[Unreleased]: https://github.com/hrkfdn/ncspot/compare/v1.5.0...HEAD
 [1.5.0]: https://github.com/hrkfdn/ncspot/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/hrkfdn/ncspot/compare/v1.3.4...v1.4.0
 [1.3.4]: https://github.com/hrkfdn/ncspot/compare/v1.3.3...v1.3.4

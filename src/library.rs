@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::iter::Iterator;
 use std::path::Path;
@@ -6,7 +6,6 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 use log::{debug, error, info};
-use rspotify::model::Id;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -33,6 +32,13 @@ const CACHE_ARTISTS: &str = "artists.db";
 /// Cached playlists database filename.
 const CACHE_PLAYLISTS: &str = "playlists.db";
 
+/// Cached shows database filename.
+const CACHE_SHOWS: &str = "shows.db";
+
+/// Version marker for the on-disk caches. Kept in the cache directory so it is updated even
+/// when ncspot exits without saving the user state.
+const CACHE_VERSION_FILE: &str = "cache_version";
+
 /// The user library with all their saved tracks, albums, playlists... High level interface to the
 /// Spotify API used to manage items in the user library.
 #[derive(Clone)]
@@ -44,7 +50,7 @@ pub struct Library {
     pub shows: Arc<RwLock<Vec<Show>>>,
     pub is_done: Arc<RwLock<bool>>,
     pub user_id: Option<String>,
-    pub display_name: Option<String>,
+    pub display_name: Arc<RwLock<Option<String>>>,
     ev: EventManager,
     spotify: Spotify,
     pub cfg: Arc<Config>,
@@ -62,7 +68,7 @@ impl Library {
             shows: Arc::new(RwLock::new(Vec::new())),
             is_done: Arc::new(RwLock::new(false)),
             user_id: None,
-            display_name: None,
+            display_name: Arc::new(RwLock::new(None)),
             ev,
             spotify,
             cfg,
@@ -70,9 +76,31 @@ impl Library {
     }
 
     pub fn new(ev: EventManager, spotify: Spotify, cfg: Arc<Config>) -> Self {
-        let current_user = spotify.api.current_user().ok();
-        let user_id = current_user.as_ref().map(|u| u.id.id().to_string());
-        let display_name = current_user.as_ref().and_then(|u| u.display_name.clone());
+        let user_id = spotify.api.user();
+        let display_name = Arc::new(RwLock::new(None));
+        // fetched in the background, a rate limit would otherwise block startup
+        if !cfg.values().hide_display_names.unwrap_or(false) {
+            if let Some((id, name)) = &cfg.state().display_name
+                && user_id.as_ref() == Some(id)
+            {
+                *display_name.write().unwrap() = Some(name.clone());
+            }
+            let display_name = display_name.clone();
+            let spotify = spotify.clone();
+            let cfg = cfg.clone();
+            let user_id = user_id.clone();
+            let ev = ev.clone();
+            thread::spawn(move || {
+                if let Ok(user) = spotify.api.current_user() {
+                    let cached = user_id.zip(user.display_name.clone());
+                    cfg.with_state_mut(|state| state.display_name = cached.clone());
+                    *display_name.write().unwrap() = user.display_name;
+                    ev.trigger();
+                }
+            });
+        } else {
+            cfg.with_state_mut(|state| state.display_name = None);
+        }
 
         let library = Self {
             tracks: Arc::new(RwLock::new(Vec::new())),
@@ -88,13 +116,31 @@ impl Library {
             cfg,
         };
 
-        library.update_library();
+        library.update_library(false);
         library
+    }
+
+    /// The version of the cache files on disk.
+    fn saved_cache_version(&self) -> u16 {
+        std::fs::read_to_string(config::cache_path(CACHE_VERSION_FILE))
+            .ok()
+            .and_then(|version| version.trim().parse().ok())
+            .unwrap_or_else(|| self.cfg.state().cache_version)
+    }
+
+    /// Mark the cache files as written by the current version.
+    fn save_cache_version(&self) {
+        if let Err(e) = std::fs::write(
+            config::cache_path(CACHE_VERSION_FILE),
+            CACHE_VERSION.to_string(),
+        ) {
+            error!("could not write cache version: {e}");
+        }
     }
 
     /// Load cached items from the file at `cache_path` into the given `store`.
     fn load_cache<T: DeserializeOwned>(&self, cache_path: &Path, store: &mut Vec<T>) {
-        let saved_cache_version = self.cfg.state().cache_version;
+        let saved_cache_version = self.saved_cache_version();
         if saved_cache_version < CACHE_VERSION {
             debug!(
                 "Cache version for {cache_path:?} has changed from {saved_cache_version} to {CACHE_VERSION}, ignoring cache"
@@ -135,30 +181,25 @@ impl Library {
         }
     }
 
-    /// Check whether the `remote` [Playlist] is newer than its locally saved version. Returns
-    /// `true` if it is or if a local version isn't found.
+    /// Whether `remote` is missing locally or the local copy is stale.
     fn needs_download(&self, remote: &Playlist) -> bool {
         self.playlists
             .read()
             .unwrap()
             .iter()
             .find(|local| local.id == remote.id)
-            .map(|local| local.snapshot_id != remote.snapshot_id)
-            .unwrap_or(true)
+            .is_none_or(|local| is_stale(local, remote))
     }
 
-    /// Append `updated` to the local playlists or update the local version if it exists. Return the
-    /// index of the appended/updated playlist.
-    fn append_or_update(&self, updated: Playlist) -> usize {
+    /// Replace the local playlist that has the same ID with `updated`, or add `updated` at the end
+    /// (at the front if `add_at_front`).
+    fn append_or_update(&self, updated: Playlist, add_at_front: bool) {
         let mut store = self.playlists.write().unwrap();
-        for (index, local) in store.iter_mut().enumerate() {
-            if local.id == updated.id {
-                *local = updated;
-                return index;
-            }
+        match store.iter_mut().find(|local| local.id == updated.id) {
+            Some(local) => *local = updated,
+            None if add_at_front => store.insert(0, updated),
+            None => store.push(updated),
         }
-        store.push(updated);
-        store.len() - 1
     }
 
     /// Delete the playlist with the given `id` if it exists.
@@ -191,7 +232,15 @@ impl Library {
         debug!("saving {} tracks to list {}", tracks.len(), id);
         self.spotify.api.overwrite_playlist(id, tracks);
 
-        self.fetch_playlists();
+        // only reload this playlist, as a full sync runs on the UI thread here
+        if let Ok(remote) = self.spotify.api.playlist(id) {
+            let mut playlist = Playlist::from(&remote);
+            playlist.num_tracks = tracks.len();
+            playlist.tracks = Some(tracks.to_vec());
+            // a new playlist goes first, as on Spotify
+            self.append_or_update(playlist, true);
+            self.trigger_redraw();
+        }
         self.save_cache(
             &config::cache_path(CACHE_PLAYLISTS),
             &self.playlists.read().unwrap(),
@@ -208,11 +257,17 @@ impl Library {
     }
 
     /// Update the local library and its cache on disk.
-    pub fn update_library(&self) {
+    ///
+    /// # Arguments
+    ///
+    /// * `refetch_unchanged` - Download all liked songs and saved albums, even if they haven't
+    ///   changed.
+    pub fn update_library(&self, refetch_unchanged: bool) {
         *self.is_done.write().unwrap() = false;
 
         let library = self.clone();
         thread::spawn(move || {
+            let update_started = std::time::Instant::now();
             let t_tracks = {
                 let library = library.clone();
                 thread::spawn(move || {
@@ -220,11 +275,12 @@ impl Library {
                         &config::cache_path(CACHE_TRACKS),
                         library.tracks.write().unwrap().as_mut(),
                     );
-                    library.fetch_tracks();
-                    library.save_cache(
-                        &config::cache_path(CACHE_TRACKS),
-                        &library.tracks.read().unwrap(),
-                    );
+                    if library.fetch_tracks(refetch_unchanged) {
+                        library.save_cache(
+                            &config::cache_path(CACHE_TRACKS),
+                            &library.tracks.read().unwrap(),
+                        );
+                    }
                 })
             };
 
@@ -235,11 +291,12 @@ impl Library {
                         &config::cache_path(CACHE_ALBUMS),
                         library.albums.write().unwrap().as_mut(),
                     );
-                    library.fetch_albums();
-                    library.save_cache(
-                        &config::cache_path(CACHE_ALBUMS),
-                        &library.albums.read().unwrap(),
-                    );
+                    if library.fetch_albums(refetch_unchanged) {
+                        library.save_cache(
+                            &config::cache_path(CACHE_ALBUMS),
+                            &library.albums.read().unwrap(),
+                        );
+                    }
                 })
             };
 
@@ -272,7 +329,15 @@ impl Library {
             let t_shows = {
                 let library = library.clone();
                 thread::spawn(move || {
+                    library.load_cache(
+                        &config::cache_path(CACHE_SHOWS),
+                        library.shows.write().unwrap().as_mut(),
+                    );
                     library.fetch_shows();
+                    library.save_cache(
+                        &config::cache_path(CACHE_SHOWS),
+                        &library.shows.read().unwrap(),
+                    );
                 })
             };
 
@@ -289,9 +354,11 @@ impl Library {
             t_playlists.join().unwrap();
             t_shows.join().unwrap();
 
+            library.save_cache_version();
             let mut is_done = library.is_done.write().unwrap();
             *is_done = true;
 
+            info!("Library update finished in {:?}", update_started.elapsed());
             library.ev.trigger();
         });
     }
@@ -301,22 +368,26 @@ impl Library {
         debug!("loading shows");
 
         let mut saved_shows: Vec<Show> = Vec::new();
-        let mut shows_result = self.spotify.api.get_saved_shows(0).ok();
+        let mut offset = 0;
 
-        while let Some(shows) = shows_result {
+        loop {
+            let Ok(shows) = self.spotify.api.get_saved_shows(offset) else {
+                error!("Failed to load all saved shows");
+                // keep the disk cache when there is one; a partial list beats an empty screen otherwise
+                let mut store = self.shows.write().unwrap();
+                if store.is_empty() {
+                    *store = saved_shows;
+                }
+                return;
+            };
             saved_shows.extend(shows.items.iter().map(|show| (&show.show).into()));
 
             // load next batch if necessary
-            shows_result = match shows.next {
-                Some(_) => {
-                    debug!("requesting shows again..");
-                    self.spotify
-                        .api
-                        .get_saved_shows(shows.offset + shows.items.len() as u32)
-                        .ok()
-                }
-                None => None,
+            if shows.next.is_none() {
+                break;
             }
+            debug!("requesting shows again..");
+            offset = shows.offset + shows.items.len() as u32;
         }
 
         *self.shows.write().unwrap() = saved_shows;
@@ -326,53 +397,53 @@ impl Library {
     /// the local version with the remote, pruning removed playlists in the process.
     fn fetch_playlists(&self) {
         debug!("loading playlists");
-        let mut stale_lists = self.playlists.read().unwrap().clone();
-        let mut list_order = Vec::new();
+        let cached: HashSet<String> = self
+            .playlists
+            .read()
+            .unwrap()
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        let mut list_order: HashMap<String, usize> = HashMap::new();
 
         let lists_page = self.spotify.api.current_user_playlist();
         let mut lists_batch = Some(lists_page.items.read().unwrap().clone());
         while let Some(lists) = lists_batch {
-            for (index, remote) in lists.iter().enumerate() {
-                list_order.push(remote.id.clone());
-
-                // remove from stale playlists so we won't prune it later on
-                if let Some(index) = stale_lists.iter().position(|x| x.id == remote.id) {
-                    stale_lists.remove(index);
+            for remote in lists.iter() {
+                list_order.insert(remote.id.clone(), list_order.len());
+                if !self.needs_download(remote) {
+                    continue;
                 }
 
-                if self.needs_download(remote) {
-                    info!("updating playlist {} (index: {})", remote.name, index);
-                    let mut playlist: Playlist = remote.clone();
-                    playlist.tracks = None;
-                    playlist.load_tracks(&self.spotify);
-                    self.append_or_update(playlist);
-                    // trigger redraw
-                    self.trigger_redraw();
-                }
+                // Playlist tracks are loaded lazily when the playlist is opened or played.
+                info!("updating playlist metadata: {}", remote.name);
+                let mut playlist: Playlist = remote.clone();
+                playlist.tracks = None;
+                self.append_or_update(playlist, false);
+                // trigger redraw
+                self.trigger_redraw();
             }
             lists_batch = lists_page.next();
         }
 
-        // remove stale playlists
-        for stale in stale_lists {
-            let index = self
-                .playlists
-                .read()
-                .unwrap()
-                .iter()
-                .position(|x| x.id == stale.id);
-            if let Some(index) = index {
-                debug!("removing stale list: {:?}", stale.name);
-                self.playlists.write().unwrap().remove(index);
-            }
+        // only a complete listing shows which playlists were removed
+        if lists_page.is_complete() {
+            self.playlists.write().unwrap().retain(|p| {
+                let removed = cached.contains(&p.id) && !list_order.contains_key(&p.id);
+                if removed {
+                    debug!("removing stale list: {:?}", p.name);
+                }
+                !removed
+            });
+        } else {
+            error!("Failed to load all playlists, keeping cached playlists");
         }
 
-        // sort by remote order
-        self.playlists.write().unwrap().sort_by(|a, b| {
-            let a_index = list_order.iter().position(|x| x == &a.id);
-            let b_index = list_order.iter().position(|x| x == &b.id);
-            a_index.cmp(&b_index)
-        });
+        // sort by remote order, unlisted ones last
+        self.playlists
+            .write()
+            .unwrap()
+            .sort_by_key(|p| list_order.get(&p.id).copied().unwrap_or(usize::MAX));
 
         // trigger redraw
         self.trigger_redraw();
@@ -434,7 +505,11 @@ impl Library {
     }
 
     /// Fetch the albums from the web API and store them in the local library.
-    fn fetch_albums(&self) {
+    ///
+    /// # Returns
+    ///
+    /// `false` if the cache doesn't need saving.
+    fn fetch_albums(&self, refetch_unchanged: bool) -> bool {
         let mut albums: Vec<Album> = Vec::new();
         let mut i = 0u32;
 
@@ -449,35 +524,40 @@ impl Library {
 
             if page.is_err() {
                 error!("Failed to fetch albums.");
-                return;
+                // Save anyway, so a cache from an older version is replaced.
+                return true;
             }
 
             let page = page.unwrap();
-            albums.extend(page.items.iter().map(|a| a.into()));
+            let items: Vec<Album> = page.items.iter().map(|a| a.into()).collect();
+
+            if !refetch_unchanged
+                && page.offset == 0
+                && albums_unchanged(page.total, &items, &self.albums.read().unwrap())
+            {
+                // A cache written by an older version may use the old sort.
+                return sort_albums(&mut self.albums.write().unwrap());
+            }
+
+            albums.extend(items);
 
             if page.next.is_none() {
                 break;
             }
         }
 
-        albums.sort_unstable_by_key(|album| {
-            let album_artist = album.artists[0]
-                .strip_prefix("The ")
-                .unwrap_or(&album.artists[0]);
-            let album_title = album.title.strip_prefix("The ").unwrap_or(&album.title);
-            format!(
-                "{}{}{}",
-                album_artist.to_lowercase(),
-                album.year,
-                album_title.to_lowercase()
-            )
-        });
+        sort_albums(&mut albums);
 
         *self.albums.write().unwrap() = albums;
+        true
     }
 
     /// Fetch the tracks from the web API and save them in the local library.
-    fn fetch_tracks(&self) {
+    ///
+    /// # Returns
+    ///
+    /// `false` if the cache doesn't need saving.
+    fn fetch_tracks(&self, refetch_unchanged: bool) -> bool {
         let mut tracks = Vec::new();
         let mut i = 0u32;
 
@@ -492,28 +572,20 @@ impl Library {
 
             if page.is_err() {
                 error!("Failed to fetch tracks.");
-                return;
+                // Save anyway, so a cache from an older version is replaced.
+                return true;
             }
             let page = page.unwrap();
+            let items: Vec<Track> = page.items.iter().map(|t| t.into()).collect();
 
-            if page.offset == 0 {
-                // If first page matches the first items in store and total is
-                // identical, assume list is unchanged.
-
-                let store = self.tracks.read().unwrap();
-
-                if page.total as usize == store.len()
-                    && !page
-                        .items
-                        .iter()
-                        .enumerate()
-                        .any(|(i, t)| t.track.id.as_ref().map(|id| id.to_string()) != store[i].id)
-                {
-                    return;
-                }
+            if !refetch_unchanged
+                && page.offset == 0
+                && tracks_unchanged(page.total, &items, &self.tracks.read().unwrap())
+            {
+                return false;
             }
 
-            tracks.extend(page.items.iter().map(|t| t.into()));
+            tracks.extend(items);
 
             if page.next.is_none() {
                 break;
@@ -521,6 +593,7 @@ impl Library {
         }
 
         *self.tracks.write().unwrap() = tracks;
+        true
     }
 
     fn populate_artists(&self) {
@@ -553,10 +626,9 @@ impl Library {
         }
 
         artists.sort_unstable_by(|a, b| {
-            let a_cmp = a.name.strip_prefix("The ").unwrap_or(&a.name);
-            let b_cmp = b.name.strip_prefix("The ").unwrap_or(&b.name);
-
-            a_cmp.partial_cmp(b_cmp).unwrap()
+            trim_leading_the(&a.name)
+                .partial_cmp(trim_leading_the(&b.name))
+                .unwrap()
         });
 
         // Add saved tracks to artists
@@ -606,6 +678,25 @@ impl Library {
             &config::cache_path(CACHE_PLAYLISTS),
             &self.playlists.read().unwrap(),
         );
+    }
+
+    /// Update the cached album with the same ID after its tracks were loaded.
+    pub fn album_update(&self, updated: &Album) {
+        let changed = {
+            let mut albums = self.albums.write().unwrap();
+            if let Some(album) = albums.iter_mut().find(|album| album.id == updated.id) {
+                *album = updated.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.save_cache(
+                &config::cache_path(CACHE_ALBUMS),
+                &self.albums.read().unwrap(),
+            );
+        }
     }
 
     /// Check whether `track` is saved in the user's library.
@@ -726,9 +817,7 @@ impl Library {
             let mut store = self.albums.write().unwrap();
             if !store.iter().any(|a| a.id == album.id) {
                 store.insert(0, album.clone());
-
-                // resort list of albums
-                store.sort_unstable_by_key(|a| format!("{}{}{}", a.artists[0], a.year, a.title));
+                sort_albums(&mut store);
             }
         }
 
@@ -927,5 +1016,254 @@ impl Library {
     /// Force redraw the user interface.
     pub fn trigger_redraw(&self) {
         self.ev.trigger();
+    }
+}
+
+/// New saves are listed first, so any change shows in the first page or the total.
+fn tracks_unchanged(total: u32, first_page: &[Track], cached: &[Track]) -> bool {
+    total as usize == cached.len()
+        && first_page
+            .iter()
+            .zip(cached)
+            .all(|(new, old)| new.id == old.id)
+}
+
+/// Saved albums are cached sorted by artist, so check that every album on the first page is
+/// cached. Albums saved in ncspot can lack data the API gives (such as their tracks) and have no
+/// `added_at`, so refetch once if any are cached.
+fn albums_unchanged(total: u32, first_page: &[Album], cached: &[Album]) -> bool {
+    total as usize == cached.len()
+        && cached.iter().all(|a| a.added_at.is_some())
+        && first_page
+            .iter()
+            .all(|new| cached.iter().any(|old| old.id == new.id))
+}
+
+/// Returns `true` if the order changed.
+fn sort_albums(albums: &mut [Album]) -> bool {
+    if albums.is_sorted_by_key(album_sort_key) {
+        return false;
+    }
+    albums.sort_unstable_by_key(album_sort_key);
+    true
+}
+
+fn album_sort_key(album: &Album) -> String {
+    format!(
+        "{}{}{}",
+        trim_leading_the(&album.artists[0]).to_lowercase(),
+        album.year,
+        trim_leading_the(&album.title).to_lowercase()
+    )
+}
+
+fn trim_leading_the(name: &str) -> &str {
+    name.strip_prefix("The ").unwrap_or(name)
+}
+
+/// Whether the cached playlist metadata is older than the remote snapshot. Tracks are loaded
+/// lazily, independently of the metadata sync.
+fn is_stale(local: &Playlist, remote: &Playlist) -> bool {
+    local.snapshot_id != remote.snapshot_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{albums_unchanged, sort_albums, tracks_unchanged};
+    use crate::model::album::Album;
+    use crate::model::track::Track;
+
+    fn tracks(ids: &[&str]) -> Vec<Track> {
+        ids.iter()
+            .map(|id| Track {
+                id: Some(id.to_string()),
+                uri: String::new(),
+                title: String::new(),
+                track_number: 0,
+                disc_number: 0,
+                duration: 0,
+                artists: Vec::new(),
+                artist_ids: Vec::new(),
+                album: None,
+                album_id: None,
+                album_artists: Vec::new(),
+                cover_url: None,
+                url: String::new(),
+                added_at: None,
+                list_index: 0,
+                is_local: false,
+                is_playable: None,
+            })
+            .collect()
+    }
+
+    fn album(id: &str, artist: &str, title: &str, added_at: Option<&str>) -> Album {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": title,
+            "artists": [artist],
+            "artist_ids": [],
+            "year": "2000",
+            "added_at": added_at,
+        }))
+        .unwrap()
+    }
+
+    fn albums(ids: &[&str]) -> Vec<Album> {
+        ids.iter()
+            .map(|id| album(id, "artist", "title", Some("2026-01-01T00:00:00Z")))
+            .collect()
+    }
+
+    #[test]
+    fn tracks_with_same_total_and_first_page_are_unchanged() {
+        assert!(tracks_unchanged(
+            3,
+            &tracks(&["c", "b"]),
+            &tracks(&["c", "b", "a"])
+        ));
+    }
+
+    #[test]
+    fn track_removal_changes_the_total() {
+        assert!(!tracks_unchanged(
+            2,
+            &tracks(&["c", "b"]),
+            &tracks(&["c", "b", "a"])
+        ));
+    }
+
+    #[test]
+    fn track_addition_shows_in_the_first_page() {
+        assert!(!tracks_unchanged(
+            3,
+            &tracks(&["d", "c"]),
+            &tracks(&["c", "b", "a"])
+        ));
+    }
+
+    #[test]
+    fn track_saved_again_moves_to_the_top() {
+        assert!(!tracks_unchanged(
+            3,
+            &tracks(&["a", "c"]),
+            &tracks(&["c", "b", "a"])
+        ));
+    }
+
+    #[test]
+    fn albums_cached_in_another_order_are_unchanged() {
+        assert!(albums_unchanged(
+            3,
+            &albums(&["c", "b"]),
+            &albums(&["a", "b", "c"])
+        ));
+    }
+
+    #[test]
+    fn album_removal_changes_the_total() {
+        assert!(!albums_unchanged(
+            2,
+            &albums(&["c", "b"]),
+            &albums(&["a", "b", "c"])
+        ));
+    }
+
+    #[test]
+    fn album_addition_shows_in_the_first_page() {
+        assert!(!albums_unchanged(
+            3,
+            &albums(&["d", "c"]),
+            &albums(&["a", "b", "c"])
+        ));
+    }
+
+    #[test]
+    fn album_saved_in_ncspot_is_refreshed() {
+        let mut cached = albums(&["a", "b", "c"]);
+        cached[0].added_at = None;
+        assert!(!albums_unchanged(3, &albums(&["c", "b"]), &cached));
+    }
+
+    #[test]
+    fn albums_sort_ignores_case_and_leading_the() {
+        let mut list = vec![
+            album("1", "The Beatles", "Abbey Road", None),
+            album("2", "abba", "Arrival", None),
+            album("3", "Cream", "Disraeli Gears", None),
+        ];
+        assert!(sort_albums(&mut list));
+        let ids: Vec<_> = list.iter().map(|a| a.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["2", "1", "3"]);
+        assert!(!sort_albums(&mut list));
+    }
+}
+
+#[cfg(test)]
+mod playlist_tests {
+    use super::*;
+
+    fn playlist(snapshot_id: &str, num_tracks: usize, tracks: Option<Vec<Playable>>) -> Playlist {
+        Playlist {
+            id: "id".to_string(),
+            name: "name".to_string(),
+            owner_id: "owner".to_string(),
+            owner_name: None,
+            snapshot_id: snapshot_id.to_string(),
+            num_tracks,
+            tracks,
+            collaborative: false,
+        }
+    }
+
+    #[test]
+    fn playlist_is_stale_when_snapshot_changed() {
+        assert!(is_stale(
+            &playlist("a", 0, Some(vec![])),
+            &playlist("b", 0, None)
+        ));
+    }
+
+    #[test]
+    fn playlist_with_unloaded_tracks_is_not_stale() {
+        let remote = playlist("a", 53, None);
+        assert!(!is_stale(&playlist("a", 53, None), &remote));
+        assert!(!is_stale(&playlist("a", 53, Some(vec![])), &remote));
+    }
+
+    #[test]
+    fn snapshot_change_clears_cached_tracks() {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify, cfg);
+
+        let tracks = vec![crate::queue::tests::make_track(1)];
+        library.append_or_update(playlist("old", 1, Some(tracks)), false);
+        let mut updated = playlist("new", 2, None);
+        updated.name = "renamed".to_string();
+        library.append_or_update(updated, false);
+
+        let store = library.playlists.read().unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].name, "renamed");
+        assert_eq!(store[0].snapshot_id, "new");
+        assert!(store[0].tracks.is_none());
+    }
+
+    #[test]
+    fn new_playlist_can_be_added_first() {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify, cfg);
+
+        library.append_or_update(playlist("a", 0, None), false);
+        let mut new = playlist("a", 0, None);
+        new.id = "new".to_string();
+        library.append_or_update(new, true);
+
+        let store = library.playlists.read().unwrap();
+        assert_eq!(store[0].id, "new");
     }
 }

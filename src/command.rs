@@ -51,6 +51,7 @@ const REDRAW_CMD: &str = "redraw";
 const EXECUTE_CMD: &str = "exec";
 const RECONNECT_CMD: &str = "reconnect";
 
+#[cfg(test)]
 pub const ALL_COMMANDS: &[&str] = &[
     QUIT_CMD,
     TOGGLE_PLAY_CMD,

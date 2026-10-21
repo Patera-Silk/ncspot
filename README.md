@@ -24,7 +24,7 @@ free accounts.
 - Support for tracks, albums, playlists, genres, searching...
 - Small [resource footprint](doc/resource_footprint.md)
 - Support for a lot of platforms
-- Vim keybindings out of the box
+- Vim keybindings out of the box, with command and argument completion
 - IPC socket for remote control
 
 ## Installation
@@ -35,6 +35,9 @@ Snapcraft) and the BSD's. Detailed installation instructions for each platform c
 ## Configuration
 A configuration file can be provided. The default location is `~/.config/ncspot`. Detailed
 configuration information can be found [here](/doc/users.md#configuration).
+
+ncspot requires a client ID from your own Spotify app. Setup and redirect URI
+instructions are in [Authentication](/doc/users.md#authentication).
 
 ## Building
 Building ncspot requires a working [Rust installation](https://www.rust-lang.org/tools/install) and

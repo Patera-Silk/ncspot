@@ -111,9 +111,7 @@ fn generate_manpage(subcommand_arguments: &ArgMatches) -> Result<(), DynError> {
         .unwrap_or(&default_output_directory);
     let cmd = ncspot::program_arguments();
 
-    if *output_directory == default_output_directory {
-        fs::create_dir_all(DEFAULT_OUTPUT_DIRECTORY)?;
-    }
+    fs::create_dir_all(output_directory)?;
 
     clap_mangen::generate_to(cmd, output_directory)?;
 
@@ -144,9 +142,7 @@ fn generate_shell_completion(subcommand_arguments: &ArgMatches) -> Result<(), Dy
         })
         .unwrap_or(vec![Shell::Bash, Shell::Zsh, Shell::Fish]);
 
-    if *output_directory == default_output_directory {
-        fs::create_dir_all(DEFAULT_OUTPUT_DIRECTORY)?;
-    }
+    fs::create_dir_all(output_directory)?;
 
     for shell in shells {
         clap_complete::generate_to(

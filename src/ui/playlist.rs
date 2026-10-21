@@ -1,4 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::thread;
 
 use cursive::Cursive;
 use cursive::view::ViewWrapper;
@@ -17,6 +19,8 @@ use crate::ui::listview::ListView;
 pub struct PlaylistView {
     playlist: Playlist,
     list: ListView<Playable>,
+    tracks: Arc<RwLock<Vec<Playable>>>,
+    loading: Arc<AtomicBool>,
     spotify: Spotify,
     library: Arc<Library>,
     queue: Arc<Queue>,
@@ -25,28 +29,49 @@ pub struct PlaylistView {
 impl PlaylistView {
     pub fn new(queue: Arc<Queue>, library: Arc<Library>, playlist: &Playlist) -> Self {
         let mut playlist = playlist.clone();
-        playlist.load_tracks(&queue.get_spotify());
+        let tracks = Arc::new(RwLock::new(playlist.tracks.clone().unwrap_or_default()));
+        let loading = Arc::new(AtomicBool::new(!playlist.is_loaded()));
 
-        if let Some(order) = library.cfg.state().playlist_orders.get(&playlist.id) {
+        if playlist.is_loaded()
+            && let Some(order) = library.cfg.state().playlist_orders.get(&playlist.id)
+        {
             playlist.sort(&order.key, &order.direction);
+            *tracks.write().unwrap() = playlist.tracks.clone().unwrap_or_default();
         }
 
-        let tracks = if let Some(t) = playlist.tracks.as_ref() {
-            t.clone()
-        } else {
-            Vec::new()
-        };
-
         let spotify = queue.get_spotify();
-        let list = ListView::new(
-            Arc::new(RwLock::new(tracks)),
-            queue.clone(),
-            library.clone(),
-        );
+        let list = ListView::new(tracks.clone(), queue.clone(), library.clone());
+
+        if !playlist.is_loaded() {
+            let mut playlist = playlist.clone();
+            let tracks = tracks.clone();
+            let spotify = spotify.clone();
+            let library = library.clone();
+            let order = library
+                .cfg
+                .state()
+                .playlist_orders
+                .get(&playlist.id)
+                .cloned();
+            thread::spawn(move || {
+                playlist.load_tracks(&spotify);
+                if !playlist.is_loaded() {
+                    return;
+                }
+                if let Some(order) = order {
+                    playlist.sort(&order.key, &order.direction);
+                }
+                *tracks.write().unwrap() = playlist.tracks.clone().unwrap_or_default();
+                library.playlist_update(&playlist);
+                library.trigger_redraw();
+            });
+        }
 
         Self {
             playlist,
             list,
+            tracks,
+            loading,
             spotify,
             library,
             queue,
@@ -64,22 +89,23 @@ impl ViewExt for PlaylistView {
     }
 
     fn title_sub(&self) -> String {
-        if let Some(tracks) = self.playlist.tracks.as_ref() {
-            let duration_secs = tracks.iter().map(|p| p.duration() as u64 / 1000).sum();
-            let duration = std::time::Duration::from_secs(duration_secs);
-            format!(
-                "{} tracks, {}",
-                tracks.len(),
-                crate::utils::format_duration(&duration)
-            )
-        } else {
-            "".to_string()
+        let tracks = self.tracks.read().unwrap();
+        if self.loading.load(Ordering::Relaxed) {
+            return "Loading tracks…".to_string();
         }
+        let duration_secs = tracks.iter().map(|p| p.duration() as u64 / 1000).sum();
+        let duration = std::time::Duration::from_secs(duration_secs);
+        format!(
+            "{} tracks, {}",
+            tracks.len(),
+            crate::utils::format_duration(&duration)
+        )
     }
 
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if let Command::Delete = cmd {
             let pos = self.list.get_selected_index();
+            self.playlist.tracks = Some(self.tracks.read().unwrap().clone());
 
             return if self
                 .playlist
@@ -103,10 +129,14 @@ impl ViewExt for PlaylistView {
                     .insert(self.playlist.id.clone(), order);
             });
 
-            self.playlist.sort(key, direction);
-            let tracks = self.playlist.tracks.as_ref().unwrap_or(&Vec::new()).clone();
+            {
+                let mut tracks = self.tracks.write().unwrap();
+                self.playlist.tracks = Some(tracks.clone());
+                self.playlist.sort(key, direction);
+                *tracks = self.playlist.tracks.clone().unwrap_or_default();
+            }
             self.list = ListView::new(
-                Arc::new(RwLock::new(tracks)),
+                self.tracks.clone(),
                 self.queue.clone(),
                 self.library.clone(),
             );

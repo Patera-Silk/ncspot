@@ -106,6 +106,17 @@ pub struct ConfigValues {
     /// schemes: `http://` (CONNECT proxy) and `socks5h://` (SOCKS5 proxy with
     /// remote DNS resolution). Both accept `user:password@host:port`.
     pub proxy: Option<String>,
+    /// Client ID of the user's own Spotify app, used for Web API calls. This is
+    /// a public OAuth identifier, not a client secret, but it is kept local so
+    /// every installation can use its own rate limit.
+    pub client_id: Option<String>,
+    /// Optional separate client ID for the Spotify session. Defaults to
+    /// `client_id`.
+    pub spotify_client_id: Option<String>,
+    /// Local port for OAuth redirects. Register
+    /// `http://127.0.0.1:<port>/login` and `http://127.0.0.1:<port>/ncspot_login`
+    /// in the Spotify app.
+    pub oauth_redirect_port: Option<u16>,
 }
 
 /// The ncspot theme.
@@ -158,6 +169,8 @@ pub struct UserState {
     pub playlist_orders: HashMap<String, SortingOrder>,
     pub cache_version: u16,
     pub playback_state: PlaybackState,
+    /// Display name of the logged in user as (user ID, name), shown until `/me` answers.
+    pub display_name: Option<(String, String)>,
 }
 
 impl Default for UserState {
@@ -170,6 +183,7 @@ impl Default for UserState {
             playlist_orders: HashMap::new(),
             cache_version: 0,
             playback_state: PlaybackState::Default,
+            display_name: None,
         }
     }
 }
@@ -335,7 +349,7 @@ pub fn preload_proxy_environment(filename: Option<String>) {
         Some(("socks5h", rest)) => format!("socks5://{rest}"),
         _ => proxy.clone(),
     };
-    log::info!("Setting proxy {proxy}");
+    log::info!("Setting the configured proxy");
     unsafe {
         std::env::set_var("ALL_PROXY", &proxy);
         std::env::set_var("all_proxy", ureq_proxy);
@@ -413,5 +427,25 @@ pub fn set_configuration_base_path(base_path: Option<PathBuf>) {
             fs::create_dir_all(&basepath).expect("could not create basepath directory");
         }
         *BASE_PATH.write().unwrap() = Some(basepath);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserState;
+
+    #[test]
+    fn user_state_without_display_name_still_loads() {
+        let mut value = serde_cbor::value::to_value(UserState::default()).unwrap();
+        let serde_cbor::Value::Map(map) = &mut value else {
+            panic!("user state is not a map");
+        };
+        assert!(
+            map.remove(&serde_cbor::Value::Text("display_name".into()))
+                .is_some()
+        );
+        let bytes = serde_cbor::to_vec(&value).unwrap();
+        let state: UserState = serde_cbor::from_slice(&bytes).unwrap();
+        assert!(state.display_name.is_none());
     }
 }

@@ -15,8 +15,9 @@ use cursive::{Cursive, Printer};
 use unicode_width::UnicodeWidthStr;
 
 use crate::application::UserData;
-use crate::command::{self, ALL_COMMANDS, Command, JumpMode};
+use crate::command::{self, Command, JumpMode};
 use crate::commands::CommandResult;
+use crate::completion;
 use crate::config::{self, Config};
 use crate::events;
 use crate::ext_traits::CursiveExt;
@@ -39,6 +40,23 @@ pub struct Layout {
     /// Pending count prefix, cleared when a prompt opens so it can't leak onto
     /// the next keypress.
     pending_count: Arc<AtomicUsize>,
+    /// Active Tab completion cycle.
+    completion_cycle: Option<CompletionCycle>,
+    /// Commands submitted in this session, oldest first.
+    history: Vec<String>,
+    /// Current position while browsing history. `None` means editing a new command.
+    history_index: Option<usize>,
+    /// Text that was being edited before browsing history.
+    history_draft: String,
+}
+
+struct CompletionCycle {
+    /// Content last written by the completer.
+    content: String,
+    /// Full command line alternatives.
+    candidates: Vec<String>,
+    /// The candidate currently shown, or `None` while the common prefix is shown.
+    index: Option<usize>,
 }
 
 impl Layout {
@@ -58,8 +76,11 @@ impl Layout {
         let event_manager = ev.clone();
         // 1. When a search was submitted on the commandline...
         command_line_input.set_on_submit(move |s, cmd| {
-            // 2. Clear the commandline on Layout...
-            s.on_layout(|_, mut layout| layout.clear_cmdline());
+            // 2. Save history and clear the commandline on Layout...
+            s.on_layout(|_, mut layout| {
+                layout.record_history(cmd);
+                layout.clear_cmdline();
+            });
 
             // 3. Get the actual command without the prefix (like `:` or `/`)...
             let mut command_characters = cmd.chars();
@@ -88,7 +109,18 @@ impl Layout {
                     }
                     Err(err) => {
                         // 6. Set an error message on the global layout.
-                        s.on_layout(|_, mut layout| layout.set_result(Err(err.to_string())));
+                        let message = match &err {
+                            command::CommandParseError::NoSuchCommand { cmd } => {
+                                match completion::suggest_command(cmd) {
+                                    Some(suggestion) => {
+                                        format!("{err}. Did you mean \"{suggestion}\"?")
+                                    }
+                                    None => err.to_string(),
+                                }
+                            }
+                            _ => err.to_string(),
+                        };
+                        s.on_layout(|_, mut layout| layout.set_result(Err(message)));
                     }
                 }
             }
@@ -110,6 +142,10 @@ impl Layout {
             theme,
             configuration,
             pending_count,
+            completion_cycle: None,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 
@@ -177,6 +213,9 @@ impl Layout {
         self.cmdline_focus = false;
         self.result = Ok(None);
         self.result_time = None;
+        self.completion_cycle = None;
+        self.history_index = None;
+        self.history_draft.clear();
     }
 
     fn get_result(&self) -> Result<Option<String>, String> {
@@ -278,10 +317,31 @@ impl Layout {
     /// Propagate the given event to the command line.
     fn command_line_handle_event(&mut self, event: Event) -> EventResult {
         let is_left_right_event = matches!(event, Event::Key(Key::Left) | Event::Key(Key::Right));
-        let result = match event {
+        let handled = match event {
             // [Key::Tab] isn't actually handled by EditView internally.
-            Event::Key(Key::Tab) => self.command_completion(),
-            _ => self.cmdline.on_event(event),
+            Event::Key(Key::Tab) => {
+                let result = self.command_completion(true);
+                return result;
+            }
+            Event::Shift(Key::Tab) => {
+                let result = self.command_completion(false);
+                return result;
+            }
+            Event::Key(Key::Up) => {
+                self.history_previous();
+                EventResult::consumed()
+            }
+            Event::Key(Key::Down) => {
+                self.history_next();
+                EventResult::consumed()
+            }
+            _ => {
+                self.completion_cycle = None;
+                self.history_index = None;
+                self.result = Ok(None);
+                self.result_time = None;
+                self.cmdline.on_event(event)
+            }
         };
 
         if self.cmdline.get_content().is_empty() {
@@ -291,31 +351,109 @@ impl Layout {
         if is_left_right_event {
             EventResult::consumed()
         } else {
-            result
+            handled
         }
     }
 
-    /// Completes the command line when the `cmdline` input uniquely matches a command.
-    ///
-    /// TODO: Add support for aliases.
-    ///
-    /// # Returns
-    ///
-    /// [EventResult::Consumed]
-    fn command_completion(&mut self) -> EventResult {
+    /// Complete the current command line. Subsequent Tab presses cycle through the matches.
+    fn command_completion(&mut self, forward: bool) -> EventResult {
         let content = self.cmdline.get_content();
 
-        // Strip the prefix from the content and store it for further processing.
-        let mut content_chars = content.chars();
-        let prefix = content_chars.next();
-        let command_without_prefix = content_chars.as_str();
+        if let Some(cycle) = &mut self.completion_cycle
+            && cycle.content == *content
+            && !cycle.candidates.is_empty()
+        {
+            let len = cycle.candidates.len();
+            let next = match (cycle.index, forward) {
+                (None, true) => Some(0),
+                (None, false) => Some(len - 1),
+                (Some(index), true) => Some((index + 1) % len),
+                (Some(index), false) => Some((index + len - 1) % len),
+            };
+            cycle.index = next;
+            let candidate = next.and_then(|index| cycle.candidates.get(index)).cloned();
+            if let Some(candidate) = candidate {
+                cycle.content = candidate.clone();
+                let _ = self.cmdline.set_content(&candidate);
+                self.set_cmdline_hint(Some(format!(
+                    "{} / {} — Shift+Tab goes back",
+                    next.unwrap_or_default() + 1,
+                    len
+                )));
+            }
+            return EventResult::consumed();
+        }
 
-        let command = word_completion(command_without_prefix, ALL_COMMANDS);
-        let _ = match prefix {
-            Some(prefix) => self.cmdline.set_content(format!("{prefix}{command}")),
-            None => self.cmdline.set_content(command),
+        let command_key = self
+            .configuration
+            .values()
+            .command_key
+            .unwrap_or(config::DEFAULT_COMMAND_KEY);
+        let completion = completion::complete_with_prefix(&content, command_key);
+        let _ = self.cmdline.set_content(&completion.completed);
+        self.set_cmdline_hint(completion.hint);
+        self.completion_cycle = if completion.candidates.len() > 1 {
+            Some(CompletionCycle {
+                content: completion.completed,
+                candidates: completion.candidates,
+                index: None,
+            })
+        } else {
+            None
         };
         EventResult::consumed()
+    }
+
+    fn set_cmdline_hint(&mut self, hint: Option<String>) {
+        self.result = Ok(hint);
+        self.result_time = None;
+    }
+
+    fn record_history(&mut self, command: &str) {
+        if command.is_empty() {
+            return;
+        }
+        if self.history.last().is_none_or(|last| last != command) {
+            self.history.push(command.to_string());
+            if self.history.len() > 100 {
+                self.history.remove(0);
+            }
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(0) => 0,
+            Some(index) => index - 1,
+            None => {
+                self.history_draft = self.cmdline.get_content().to_string();
+                self.history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        let _ = self.cmdline.set_content(&self.history[index]);
+        self.set_cmdline_hint(Some("Command history".to_string()));
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            let index = index + 1;
+            self.history_index = Some(index);
+            let _ = self.cmdline.set_content(&self.history[index]);
+        } else {
+            self.history_index = None;
+            let draft = self.history_draft.clone();
+            let _ = self.cmdline.set_content(&draft);
+        }
+        self.set_cmdline_hint(Some("Command history".to_string()));
     }
 }
 
@@ -551,63 +689,5 @@ impl ViewExt for Layout {
                 }
             }
         }
-    }
-}
-
-/// Completes the `input` using words from the `dictionary`.
-///
-/// # Returns
-///
-/// If no words match, `input` is returned unchanged. \
-/// If a single word matches, that word is returned. \
-/// If multiple words match, their common prefix is returned.
-fn word_completion(input: &str, dictionary: &[&str]) -> String {
-    let matching_words: Vec<_> = dictionary
-        .iter()
-        .filter(|word| word.starts_with(input))
-        .collect();
-    let Some(first_word) = matching_words.first() else {
-        return input.into();
-    };
-
-    let mut prefix: Vec<char> = first_word.chars().collect();
-
-    for word in matching_words {
-        let common_len = prefix
-            .iter()
-            .copied()
-            .zip(word.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        prefix.truncate(common_len);
-
-        if prefix.is_empty() {
-            break;
-        }
-    }
-
-    prefix.into_iter().collect::<String>()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_DICTIONARY: &[&str] = &["test1", "test2", "tset"];
-
-    #[test]
-    fn test_word_completion() {
-        // One case from the dictionary matches the input.
-        assert_eq!(word_completion("ts", TEST_DICTIONARY), "tset");
-
-        // No cases from the dictionary match the input.
-        assert_eq!(word_completion("Luna", TEST_DICTIONARY), "Luna");
-
-        // Multiple cases from the dictionary with common prefix match the input.
-        assert_eq!(word_completion("te", TEST_DICTIONARY), "test");
-
-        // Multiple cases from the dictionary without common prefix match the input.
-        assert_eq!(word_completion("t", TEST_DICTIONARY), "t");
     }
 }

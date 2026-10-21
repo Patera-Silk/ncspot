@@ -172,6 +172,12 @@ You can open a Vim-style command prompt using <kbd>:</kbd>,
 trigger command completion by pressing <kbd>Tab</kbd>
 and close it at any time with <kbd>Escape</kbd>.
 
+Completion also works for command arguments, for example `:focus li` completes
+to `:focus library`, `:repeat tr` to `:repeat track`, and `:sort title desc` to
+`:sort title descending`. Press <kbd>Tab</kbd> repeatedly to cycle through
+multiple matches and <kbd>Shift</kbd>+<kbd>Tab</kbd> to cycle backwards. Use
+<kbd>Up</kbd> and <kbd>Down</kbd> to browse commands entered in this session.
+
 The following is an abridged list of the more useful commands. For the full list, see [source code](/src/command.rs).
 
 Note: \<FOO\> - mandatory arg; [BAR] - optional arg
@@ -284,6 +290,9 @@ Possible configuration values are:
 | `[theme]`                       | Custom theme                                                   | See [custom theme](#theming)                                                          |                     |
 | `[keybindings]`                 | Custom keybindings                                             | See [custom keybindings](#custom-keybindings)                                         |                     |
 | `ap_port`                       | Set ap-port for librespot (for restrictive firewalls)          | `80`, `443`, `4070`                                                                   |                     |
+| `client_id`                     | Client ID of your own Spotify app for Web API calls            | String; see [Authentication](#authentication)                                         | required            |
+| `spotify_client_id`             | Separate client ID for the Spotify session                     | String                                                                                | `client_id`         |
+| `oauth_redirect_port`           | Local port for OAuth redirects                                 | Number                                                                                | `8989`              |
 
 1. If built with the `cover` feature.
 2. By default the statusbar will show a play icon when a track is playing and
@@ -491,8 +500,56 @@ that can be opened in any browser. After logging in on the displayed page, you c
 `ncspot`. The OAuth2 flow is the only supported one, as username/password authentication has been
 removed by Spotify.
 
-The credentials are stored in `librespot/credentials.json` in the user's cache directory. Run
-`ncspot info` to show the location of this directory.
+### Using your own Spotify app
+ncspot no longer ships with a shared client ID. Create an app in the
+[Spotify Developer Dashboard](https://developer.spotify.com/dashboard). If the
+dashboard asks which APIs or SDKs you plan to use, select **Web API**. ncspot
+uses librespot directly for playback, so you do not need the Web Playback SDK,
+iOS SDK, or Android SDK.
 
-The `logout` command can be used to remove cached credentials. See
+Scopes are not configured in the dashboard; ncspot requests them during login.
+Add both redirect URIs, replacing the port if you configure
+`oauth_redirect_port`:
+
+```
+http://127.0.0.1:8989/login
+http://127.0.0.1:8989/ncspot_login
+```
+
+Then set the app's client ID in `config.toml`:
+
+```toml
+client_id = "0123456789abcdef0123456789abcdef"
+```
+
+Alternatively, set `NCSPOT_CLIENT_ID`. The environment takes precedence. If
+you want a separate app for the Spotify session, set `spotify_client_id` or
+`NCSPOT_SPOTIFY_CLIENT_ID`; otherwise `client_id` is used for both logins.
+Keep the configuration file private if your dotfiles are shared, for example
+with `chmod 600 ~/.config/ncspot/config.toml`.
+
+The client ID is a public OAuth identifier, not a client secret. It is kept
+local so that every installation uses its own rate limit. Spotify's
+development mode limits search to 10 results per page, may hide content owned
+by other users, and removes endpoints such as Browse categories and artist top
+tracks. Request an extended quota in the Developer Dashboard if you need full
+catalog access.
+
+The credentials are stored in `librespot/credentials.json` in the user's cache
+directory. Web API tokens are stored per client ID as
+`rspotify_token_<client_id>.json` with `0600` permissions. Run `ncspot info` to
+show the cache directory.
+
+The `logout` command removes the cached credentials and Web API tokens. See
 [Vim-Like Commands](#vim-like-commands).
+
+### Shell completions
+When building from source, generate completion scripts with:
+
+```sh
+cargo run -p xtask -- generate-shell-completion -o misc
+```
+
+This writes bash, zsh, and fish completions to `misc/`. Source the file for
+your shell, or install it to your shell's completion directory. Packages can
+ship the generated files in `misc/`.
