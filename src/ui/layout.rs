@@ -494,17 +494,24 @@ impl View for Layout {
             // screen content
             let printer = &printer
                 .offset((0, 1))
-                .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
+                .cropped((
+                    printer.size.x,
+                    printer.size.y.saturating_sub(3 + cmdline_height),
+                ))
                 .focused(true);
             view.draw(printer);
         }
 
         self.statusbar
-            .draw(&printer.offset((0, printer.size.y - 2 - cmdline_height)));
+            .draw(&printer.offset((0, printer.size.y.saturating_sub(2 + cmdline_height))));
 
         if let Ok(Some(r)) = result {
-            printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
-            printer.print((0, printer.size.y - cmdline_height), &r);
+            printer.print_hline(
+                (0, printer.size.y.saturating_sub(cmdline_height)),
+                printer.size.x,
+                " ",
+            );
+            printer.print((0, printer.size.y.saturating_sub(cmdline_height)), &r);
         } else if let Err(e) = result {
             let style = ColorStyle::new(
                 ColorType::Color(*self.theme.palette.custom("error").unwrap()),
@@ -512,13 +519,20 @@ impl View for Layout {
             );
 
             printer.with_color(style, |printer| {
-                printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
-                printer.print((0, printer.size.y - cmdline_height), &format!("ERROR: {e}"));
+                printer.print_hline(
+                    (0, printer.size.y.saturating_sub(cmdline_height)),
+                    printer.size.x,
+                    " ",
+                );
+                printer.print(
+                    (0, printer.size.y.saturating_sub(cmdline_height)),
+                    &format!("ERROR: {e}"),
+                );
             });
         }
 
         if cmdline_visible {
-            let printer = &printer.offset((0, printer.size.y - 1));
+            let printer = &printer.offset((0, printer.size.y.saturating_sub(1)));
             self.cmdline.draw(printer);
         }
     }
@@ -531,7 +545,7 @@ impl View for Layout {
         self.cmdline.layout(Vec2::new(size.x, 1));
 
         if let Some(view) = self.get_current_view_mut() {
-            view.layout(Vec2::new(size.x, size.y - 3));
+            view.layout(Vec2::new(size.x, size.y.saturating_sub(3)));
         }
     }
 
@@ -612,11 +626,12 @@ impl View for Layout {
                 }
 
                 if position.y >= self.last_size.y.saturating_sub(2 + cmdline_height)
-                    && position.y < self.last_size.y - cmdline_height
+                    && position.y < self.last_size.y.saturating_sub(cmdline_height)
                 {
-                    self.statusbar.on_event(
-                        event.relativized(Vec2::new(0, self.last_size.y - 2 - cmdline_height)),
-                    );
+                    self.statusbar.on_event(event.relativized(Vec2::new(
+                        0,
+                        self.last_size.y.saturating_sub(2 + cmdline_height),
+                    )));
                     return EventResult::consumed();
                 }
 

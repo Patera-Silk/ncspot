@@ -14,6 +14,11 @@ const CLIENT_ID_ENV: &str = "NCSPOT_CLIENT_ID";
 const SPOTIFY_CLIENT_ID_ENV: &str = "NCSPOT_SPOTIFY_CLIENT_ID";
 const REDIRECT_PORT_ENV: &str = "NCSPOT_OAUTH_REDIRECT_PORT";
 
+/// Client ID used for the librespot playback session. Web API apps created in the Spotify
+/// developer dashboard are rejected by Spotify's internal metadata endpoints, so the session
+/// defaults to the public librespot keymaster client ID instead.
+const DEFAULT_SPOTIFY_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+
 /// Port used by the local OAuth redirect. Spotify requires registered redirect URIs, so this
 /// can't use a random free port.
 pub const DEFAULT_REDIRECT_PORT: u16 = 8989;
@@ -52,17 +57,13 @@ pub fn client_id(configuration: &Config) -> Result<String, String> {
         .ok_or_else(|| missing_client_id_message(configuration, CLIENT_ID_ENV, "client_id"))
 }
 
-/// The client ID for the Spotify session. Defaults to the Web API client ID, so a single Spotify
-/// app can be used for both logins.
-pub fn spotify_client_id(configuration: &Config) -> Result<String, String> {
+/// The client ID for the Spotify session. Defaults to librespot's keymaster client ID.
+pub fn spotify_client_id(configuration: &Config) -> String {
     client_id_from_env(SPOTIFY_CLIENT_ID_ENV)
         .or_else(|| configuration.values().spotify_client_id.clone())
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
-        .or_else(|| client_id(configuration).ok())
-        .ok_or_else(|| {
-            missing_client_id_message(configuration, SPOTIFY_CLIENT_ID_ENV, "spotify_client_id")
-        })
+        .unwrap_or_else(|| DEFAULT_SPOTIFY_CLIENT_ID.to_string())
 }
 
 fn client_id_from_env(name: &str) -> Option<String> {
@@ -100,17 +101,48 @@ fn get_client_redirect_uri(configuration: &Config, suffix: ClientUriSuffix) -> S
     }
 }
 
+fn session_client_id_path() -> PathBuf {
+    config::cache_path("librespot").join("session_client_id")
+}
+
+fn cached_session_client_id() -> Option<String> {
+    fs::read_to_string(session_client_id_path())
+        .ok()
+        .map(|client_id| client_id.trim().to_string())
+        .filter(|client_id| !client_id.is_empty())
+}
+
+fn store_session_client_id(client_id: &str) {
+    let path = session_client_id_path();
+    if let Some(parent) = path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        warn!("Failed to create librespot cache directory: {e}");
+        return;
+    }
+    if let Err(e) = fs::write(&path, client_id) {
+        warn!("Failed to record the Spotify session client ID: {e}");
+    }
+}
+
 /// Get credentials for use with librespot. This first tries to get cached credentials. If no cached
 /// credentials are available it will initiate the OAuth2 login process.
 pub fn get_credentials(configuration: &Config) -> Result<RespotCredentials, String> {
+    let client_id = spotify_client_id(configuration);
     let mut credentials = {
         let cache = Cache::new(Some(config::cache_path("librespot")), None, None, None)
             .expect("Could not create librespot cache");
         let cached_credentials = cache.credentials();
         match cached_credentials {
-            Some(c) => {
+            Some(c) if cached_session_client_id().as_deref() == Some(client_id.as_str()) => {
                 info!("Using cached credentials");
                 c
+            }
+            Some(_) => {
+                info!(
+                    "Cached Spotify credentials were created with a different client ID, logging in again"
+                );
+                credentials_prompt(configuration, None)?
             }
             None => {
                 info!("Attempting to login via OAuth2");
@@ -123,6 +155,7 @@ pub fn get_credentials(configuration: &Config) -> Result<RespotCredentials, Stri
         let error_msg = format!("{error}");
         credentials = credentials_prompt(configuration, Some(error_msg))?;
     }
+    store_session_client_id(&client_id);
     Ok(credentials)
 }
 
@@ -138,7 +171,7 @@ fn credentials_prompt(
 }
 
 pub fn create_credentials(configuration: &Config) -> Result<RespotCredentials, String> {
-    let client_id = spotify_client_id(configuration)?;
+    let client_id = spotify_client_id(configuration);
     println!("To login you need to perform OAuth2 authorization using your web browser\n");
     let client_builder = OAuthClientBuilder::new(
         &client_id,

@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -60,6 +61,10 @@ pub struct UserDataInner {
 /// The global Tokio runtime for running asynchronous tasks.
 pub static ASYNC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+/// Set when a termination signal has been received. The UI backend uses this to stop polling the
+/// terminal, which may no longer be usable after a hangup.
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// The representation of an ncspot application.
 pub struct Application {
     /// The music queue which controls playback order.
@@ -98,7 +103,6 @@ impl Application {
         let configuration = Arc::new(Config::new(configuration_file_path));
         info!("Configuration loaded in {:?}", startup_started.elapsed());
         authentication::client_id(&configuration)?;
-        authentication::spotify_client_id(&configuration)?;
         let credentials_started = Instant::now();
         let credentials = authentication::get_credentials(&configuration)?;
         info!(
@@ -280,6 +284,7 @@ impl Application {
             std::thread::spawn(move || {
                 if let Some(signal) = signals.forever().next() {
                     info!("Caught {signal}, cleaning up and closing");
+                    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
                     let _ = sink.send(Box::new(|s| {
                         if let Some(data) = s.user_data::<UserData>().cloned() {
                             data.cmd.handle(s, Command::Quit);

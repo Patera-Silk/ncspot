@@ -111,7 +111,7 @@ pub struct ConfigValues {
     /// every installation can use its own rate limit.
     pub client_id: Option<String>,
     /// Optional separate client ID for the Spotify session. Defaults to
-    /// `client_id`.
+    /// librespot's keymaster client ID.
     pub spotify_client_id: Option<String>,
     /// Local port for OAuth redirects. Register
     /// `http://127.0.0.1:<port>/login` and `http://127.0.0.1:<port>/ncspot_login`

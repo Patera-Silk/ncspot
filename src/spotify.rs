@@ -157,7 +157,7 @@ impl Spotify {
     /// Generate the librespot [SessionConfig] used when creating a [Session].
     pub fn session_config(cfg: &config::Config) -> SessionConfig {
         let mut session_config = librespot_core::SessionConfig {
-            client_id: spotify_client_id(cfg).unwrap_or_default(),
+            client_id: spotify_client_id(cfg),
             ..Default::default()
         };
         match cfg

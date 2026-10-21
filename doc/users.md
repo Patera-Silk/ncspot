@@ -291,7 +291,7 @@ Possible configuration values are:
 | `[keybindings]`                 | Custom keybindings                                             | See [custom keybindings](#custom-keybindings)                                         |                     |
 | `ap_port`                       | Set ap-port for librespot (for restrictive firewalls)          | `80`, `443`, `4070`                                                                   |                     |
 | `client_id`                     | Client ID of your own Spotify app for Web API calls            | String; see [Authentication](#authentication)                                         | required            |
-| `spotify_client_id`             | Separate client ID for the Spotify session                     | String                                                                                | `client_id`         |
+| `spotify_client_id`             | Separate client ID for the Spotify session                     | String                                                                                | librespot keymaster |
 | `oauth_redirect_port`           | Local port for OAuth redirects                                 | Number                                                                                | `8989`              |
 
 1. If built with the `cover` feature.
@@ -522,9 +522,15 @@ Then set the app's client ID in `config.toml`:
 client_id = "0123456789abcdef0123456789abcdef"
 ```
 
-Alternatively, set `NCSPOT_CLIENT_ID`. The environment takes precedence. If
-you want a separate app for the Spotify session, set `spotify_client_id` or
-`NCSPOT_SPOTIFY_CLIENT_ID`; otherwise `client_id` is used for both logins.
+Alternatively, set `NCSPOT_CLIENT_ID`. The environment takes precedence.
+
+The playback session uses librespot's public keymaster client ID by default.
+Client IDs of Web API apps created in the Spotify Developer Dashboard are not
+accepted by Spotify's internal playback metadata endpoints, so `client_id` is
+only used for Web API calls. Override `spotify_client_id` or
+`NCSPOT_SPOTIFY_CLIENT_ID` only if you have another client ID that is accepted
+for librespot playback.
+
 Keep the configuration file private if your dotfiles are shared, for example
 with `chmod 600 ~/.config/ncspot/config.toml`.
 

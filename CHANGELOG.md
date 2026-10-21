@@ -18,9 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Spotify client IDs are no longer hardcoded. ncspot now requires a local
+- Web API client IDs are no longer hardcoded. ncspot now requires a local
   `client_id` (or `NCSPOT_CLIENT_ID`) from your own Spotify app, so every
-  installation has its own rate limit.
+  installation has its own Web API rate limit. The playback session keeps
+  using librespot's public keymaster client ID, because Web API app client IDs
+  are rejected by Spotify's internal playback metadata endpoints.
 - Web API tokens are cached per client ID with restrictive permissions.
 - Playlist tracks load lazily when needed instead of during every startup;
   albums and podcasts are cached after loading.
@@ -57,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries failed loads after reconnecting, and resumes preloading
 - `:reconnect` now uses the saved Spotify credentials instead of an expired
   OAuth access token
+- Closing the terminal no longer aborts the process with a panic in the
+  terminal backend; the state is still saved on hangup
+- Playback no longer fails with `FaultyRequest(BAD_REQUEST)` when only a
+  Developer Dashboard Web API client ID is configured
+- Cached librespot credentials from a different session client ID are no
+  longer reused, so the required login is requested after this change
 
 ## [1.5.0]
 
